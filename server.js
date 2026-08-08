@@ -368,12 +368,6 @@ app.post('/api/restaurants/register', async (req,res)=>{
     // Silent admin notification via Telegram
     await notifySuperAdminNewRegistration(appEntry);
 
-    // Send an updated data.json backup to admins right away too — since
-    // Render's free tier wipes the local disk on every restart, this gives
-    // the admin an immediate, current copy to /restore from if the server
-    // resets before the next scheduled 6h backup.
-    sendBackupToAdmins('new_registration:'+appEntry.restaurantName).catch(e=>console.error('registration backup send failed', e.message));
-
     res.json({ok:true, message:'Registration submitted. Awaiting admin approval.', id});
   }catch(e){
     console.error(e);
@@ -493,7 +487,9 @@ app.post('/api/orders/:code/receipt', upload.single('receipt'), (req,res)=>{
   db.receipts.push({id:uuidv4(), orderCode:order.code, url, at:new Date().toISOString()});
   saveDB();
   logAudit('customer', 'UPLOAD_RECEIPT', order.code);
-  notifyRestaurantReceipt(order).catch(console.error);
+  // Send the receipt image itself (not just a link) straight into the
+  // restaurant's Telegram chat, with the full order attached as the caption.
+  notifyRestaurantReceipt(order, req.file.path, req.file.mimetype).catch(console.error);
   res.json({ok:true, url});
 });
 
@@ -801,6 +797,11 @@ if(TELEGRAM_BOT_TOKEN){
     saveDB();
     logAudit('restaurant:'+restaurant.id, 'GO_LIVE', restaurant.id);
     ctx.reply('🟢 GO LIVE SUCCESS! Your restaurant is now visible to customers.');
+
+    // Send the admin an updated data.json the moment a restaurant actually
+    // goes live — this is the point the data is worth having a fresh copy
+    // of, since Render's free tier wipes the disk on restart.
+    sendBackupToAdmins('go_live:'+restaurant.name).catch(e=>console.error('go-live backup send failed', e.message));
   });
 
   bot.command('setdelivery', async (ctx)=>{
@@ -937,19 +938,51 @@ async function notifyRestaurantNewOrder(order){
   }
 }
 
-async function notifyRestaurantReceipt(order){
+// Builds a full, human-readable order summary — customer info, delivery
+// details, every item with qty/price, and totals — reused everywhere the
+// restaurant needs to see the complete order (new order alert, receipt alert).
+function formatOrderDetails(order){
+  const itemLines = order.items.map(i=> `${i.isVeg?'🟢':'🔴'} ${i.name} × ${i.qty} — ₹${i.total}`).join('\n');
+  return `Order: ${order.code}\n`+
+    `👤 ${order.customerName} • 📞 ${order.phone}\n`+
+    `${order.deliveryType==='delivery' ? '🛵 Delivery' : '🏪 Pickup'}${order.address ? '\n📍 '+order.address : ''}\n`+
+    (order.notes ? `📝 ${order.notes}\n` : '')+
+    `\n${itemLines}\n\n`+
+    `Subtotal: ₹${order.subtotal}\n`+
+    (order.deliveryFee ? `Delivery: ₹${order.deliveryFee}\n` : '')+
+    `Total: ₹${order.total}\n`+
+    `Payment: ${order.paymentMethod}`;
+}
+
+async function notifyRestaurantReceipt(order, localFilePath, mimetype){
   if(!bot){ console.log('Mock: would notify restaurant of receipt', order.code); return; }
   const accounts = db.telegramAccounts.filter(a=>a.restaurantId===order.restaurantId);
+  const caption = `💳 PAYMENT RECEIPT RECEIVED\n\n${formatOrderDetails(order)}`;
+  const isImage = mimetype && mimetype.startsWith('image/');
   for(const acc of accounts){
     try{
-      await bot.telegram.sendMessage(acc.telegramUserId, `💳 PAYMENT RECEIPT\nOrder: ${order.code}\n${BACKEND_URL}${order.receiptUrl}`, {
-        reply_markup:{inline_keyboard:[
-          [{text:'📄 VIEW RECEIPT', url: BACKEND_URL+order.receiptUrl}],
-          [{text:'✅ VERIFY', callback_data:`verify_pay_${order.code}`}, {text:'❌ REJECT', callback_data:`reject_pay_${order.code}`}],
-          [{text:'🔄 REQUEST NEW', callback_data:`request_receipt_${order.code}`}]
-        ]}
-      });
-    }catch(e){ console.error(e.message); }
+      const buttons = {reply_markup:{inline_keyboard:[
+        [{text:'✅ VERIFY', callback_data:`verify_pay_${order.code}`}, {text:'❌ REJECT', callback_data:`reject_pay_${order.code}`}],
+        [{text:'🔄 REQUEST NEW', callback_data:`request_receipt_${order.code}`}]
+      ]}};
+      if(isImage){
+        // Sends the actual receipt photo inline in the chat, with the full
+        // order (customer, items, totals) as the caption underneath it.
+        await bot.telegram.sendPhoto(acc.telegramUserId, { source: localFilePath }, { caption, ...buttons });
+      } else {
+        // Non-image receipts (e.g. a PDF) can't render as a photo, so send
+        // as a document instead — still inline in the chat, not just a link.
+        await bot.telegram.sendDocument(acc.telegramUserId, { source: localFilePath }, { caption, ...buttons });
+      }
+    }catch(e){
+      console.error('notifyRestaurantReceipt failed', e.message);
+      // Fallback: if sending the actual file fails for any reason (too
+      // large, Telegram hiccup), at least get the order details through
+      // with a link, so the restaurant isn't left with nothing.
+      try{
+        await bot.telegram.sendMessage(acc.telegramUserId, `${caption}\n\n📄 ${BACKEND_URL}${order.receiptUrl}`, buttons);
+      }catch(e2){ console.error('notifyRestaurantReceipt fallback failed', e2.message); }
+    }
   }
 }
 
