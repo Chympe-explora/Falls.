@@ -985,11 +985,11 @@ async function notifyRestaurantReceipt(order, localFilePath, mimetype){
       if(isImage){
         // Sends the actual receipt photo inline in the chat, with the full
         // order (customer, items, totals) as the caption underneath it.
-        await bot.telegram.sendPhoto(acc.telegramUserId, { source: localFilePath }, { caption, ...buttons });
+        await withRetries(()=> bot.telegram.sendPhoto(acc.telegramUserId, { source: localFilePath }, { caption, ...buttons }));
       } else {
         // Non-image receipts (e.g. a PDF) can't render as a photo, so send
         // as a document instead — still inline in the chat, not just a link.
-        await bot.telegram.sendDocument(acc.telegramUserId, { source: localFilePath }, { caption, ...buttons });
+        await withRetries(()=> bot.telegram.sendDocument(acc.telegramUserId, { source: localFilePath }, { caption, ...buttons }));
       }
     }catch(e){
       console.error('notifyRestaurantReceipt failed', e.message);
@@ -1010,20 +1010,54 @@ async function notifyRestaurantReceipt(order, localFilePath, mimetype){
 // for: (1) a restaurant going LIVE, and (2) an already-registered restaurant
 // changing any of its info/data (menu, hours, UPI, delivery fee, QR, staff
 // PIN, open/busy toggle). Reply to the file with /restore to reload it.
-async function sendBackupToAdmins(triggeredBy='auto'){
-  if(!bot) return;
-  if(SUPER_ADMIN_IDS.length===0) return;
-  try{
-    const buffer = Buffer.from(JSON.stringify(db, null, 2), 'utf8');
-    const filename = `data.json`;
-    for(const adminId of SUPER_ADMIN_IDS){
-      try{
-        await bot.telegram.sendDocument(adminId, { source: buffer, filename }, {
-          caption: `💾 Updated data.json (${triggeredBy})\nRestaurants: ${db.restaurants.length} | Orders: ${db.orders.length} | Applications: ${db.applications.length}\n\nUpload this file directly over backend/data.json in GitHub to persist it. Reply to THIS file with /restore to reload it into a running server instead.`
-        });
-      }catch(e){ console.error('backup send failed', adminId, e.message); }
+// Small helper: retries a flaky network call a few times before giving up.
+// "socket hang up" from Render -> Telegram on file uploads is usually a
+// transient dropped connection, not a real error - a short retry clears it
+// almost every time without needing any config change.
+async function withRetries(fn, attempts=3, delayMs=1500){
+  let lastErr;
+  for(let i=1;i<=attempts;i++){
+    try{ return await fn(); }
+    catch(e){
+      lastErr = e;
+      const transient = /socket hang up|ETIMEDOUT|ECONNRESET|network|EAI_AGAIN/i.test(e.message||'');
+      if(!transient || i===attempts) throw e;
+      console.warn(`retrying after transient error (attempt ${i}/${attempts}): ${e.message}`);
+      await new Promise(r=>setTimeout(r, delayMs*i));
     }
-  }catch(e){ console.error('backup failed', e.message); }
+  }
+  throw lastErr;
+}
+
+async function sendBackupToAdmins(triggeredBy='auto'){
+  if(!bot){ console.log('sendBackupToAdmins skipped: TELEGRAM_BOT_TOKEN not set'); return; }
+  if(SUPER_ADMIN_IDS.length===0){ console.log('sendBackupToAdmins skipped: SUPER_ADMIN_TELEGRAM_IDS not set'); return; }
+  let buffer;
+  try{
+    buffer = Buffer.from(JSON.stringify(db, null, 2), 'utf8');
+  }catch(e){
+    console.error('sendBackupToAdmins: could not serialize db', e.message);
+    return;
+  }
+  const filename = `data.json`;
+  for(const adminId of SUPER_ADMIN_IDS){
+    try{
+      await withRetries(()=> bot.telegram.sendDocument(adminId, { source: buffer, filename }, {
+        caption: `💾 Updated data.json (${triggeredBy})\nRestaurants: ${db.restaurants.length} | Orders: ${db.orders.length} | Applications: ${db.applications.length}\n\nUpload this file directly over backend/data.json in GitHub to persist it. Reply to THIS file with /restore to reload it into a running server instead.`
+      }));
+    }catch(e){
+      // The old version only logged this to Render's server logs, which is
+      // why the file could silently never arrive with no visible reason.
+      // Now the admin gets a plain-text explanation right in Telegram too,
+      // after retries have already been exhausted.
+      console.error('backup send failed after retries', adminId, e.message);
+      try{
+        await bot.telegram.sendMessage(adminId, `⚠️ Tried to send the updated data.json (${triggeredBy}) 3 times but it kept failing:\n${e.message}\n\nThis is usually a dropped connection between the server and Telegram - try /backup again in a minute. If it keeps happening, check that you've sent /start to this bot and that SUPER_ADMIN_TELEGRAM_IDS on Render matches your numeric Telegram ID.`);
+      }catch(e2){
+        console.error('failure notice also failed to send', adminId, e2.message);
+      }
+    }
+  }
 }
 
 // ---- STAFF DAILY-PIN ACCESS ----
