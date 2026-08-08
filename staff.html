@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Falls — Staff</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌊</text></svg>">
+<style>
+  :root{ color-scheme: dark; }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; min-height:100vh; font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+    background:linear-gradient(160deg,#0b1020,#101a2e 60%,#0b1020);
+    color:#f2f4f8; padding:16px;
+  }
+  .wrap{max-width:520px;margin:0 auto;}
+  .card{
+    background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12);
+    backdrop-filter:blur(14px); border-radius:16px; padding:20px; margin-bottom:14px;
+  }
+  h1{font-size:20px; margin:0 0 4px;}
+  .sub{opacity:0.7; font-size:13px; margin:0 0 18px;}
+  label{display:block; font-size:12px; opacity:0.75; margin-bottom:6px; margin-top:14px;}
+  input{
+    width:100%; padding:12px 14px; border-radius:10px; border:1px solid rgba(255,255,255,0.18);
+    background:rgba(0,0,0,0.25); color:#fff; font-size:16px; letter-spacing:0.02em;
+  }
+  input:focus{outline:none; border-color:#5fd0ff;}
+  button{
+    width:100%; margin-top:18px; padding:13px; border:none; border-radius:10px;
+    background:#5fd0ff; color:#04202c; font-weight:700; font-size:15px; cursor:pointer;
+  }
+  button:disabled{opacity:0.5; cursor:default;}
+  button.ghost{background:transparent; border:1px solid rgba(255,255,255,0.25); color:#fff; margin-top:8px;}
+  button.small{width:auto; padding:8px 14px; font-size:13px; margin-top:0;}
+  .err{color:#ff6b6b; font-size:13px; margin-top:10px; min-height:16px;}
+  .topbar{display:flex; align-items:center; justify-content:space-between; margin-bottom:14px;}
+  .topbar h1{margin:0;}
+  .order{padding-bottom:14px; margin-bottom:14px; border-bottom:1px solid rgba(255,255,255,0.1);}
+  .order:last-child{border-bottom:none; margin-bottom:0; padding-bottom:0;}
+  .order-head{display:flex; justify-content:space-between; align-items:baseline; gap:8px;}
+  .code{font-weight:700; font-size:15px;}
+  .status{font-size:11px; padding:3px 9px; border-radius:999px; background:rgba(255,255,255,0.12); white-space:nowrap;}
+  .status.SUBMITTED{background:#ffb35180;}
+  .status.ACCEPTED,.status.PREPARING{background:#5fa0ff80;}
+  .status.READY{background:#5fffb080;}
+  .status.COMPLETED{background:#666;}
+  .status.REJECTED{background:#ff6b6b80;}
+  .items{font-size:13px; opacity:0.85; margin:6px 0;}
+  .actions{display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;}
+  .empty{opacity:0.6; text-align:center; padding:30px 0; font-size:14px;}
+  .meta{font-size:12px; opacity:0.6; margin-top:16px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div id="loginView" class="card">
+    <h1>🌊 FALLS — Staff</h1>
+    <p class="sub">Enter today's Restaurant ID and PIN from the owner.</p>
+    <label>Restaurant ID</label>
+    <input id="restaurantId" placeholder="Paste restaurant ID"/>
+    <label>Today's PIN</label>
+    <input id="pin" placeholder="6-digit PIN" inputmode="numeric" maxlength="6"/>
+    <button id="loginBtn" onclick="login()">LOG IN</button>
+    <div class="err" id="loginErr"></div>
+  </div>
+
+  <div id="ordersView" style="display:none;">
+    <div class="topbar">
+      <h1 id="restName">Orders</h1>
+      <button class="small ghost" onclick="logout()">Log out</button>
+    </div>
+    <div class="card">
+      <div id="ordersList"><div class="empty">Loading...</div></div>
+    </div>
+    <p class="meta" id="refreshNote"></p>
+  </div>
+
+</div>
+
+<script>
+// Same override pattern as the main app: set localStorage backend_url for local dev.
+const BACKEND_URL = localStorage.getItem('backend_url') || 'https://falls-food-backend.onrender.com';
+
+let token = sessionStorage.getItem('staff_token') || null;
+let restaurantId = sessionStorage.getItem('staff_restaurant_id') || null;
+let pollTimer = null;
+
+const TRANSITIONS = {
+  SUBMITTED: [['ACCEPTED','✅ Accept'], ['REJECTED','❌ Reject']],
+  ACCEPTED: [['PREPARING','👨‍🍳 Start preparing']],
+  PREPARING: [['READY','📦 Mark ready']],
+  READY: [['COMPLETED','✅ Complete (picked up)']],
+};
+
+function showLogin(err){
+  document.getElementById('loginView').style.display = 'block';
+  document.getElementById('ordersView').style.display = 'none';
+  document.getElementById('loginErr').textContent = err || '';
+  if(pollTimer) clearInterval(pollTimer);
+}
+function showOrders(){
+  document.getElementById('loginView').style.display = 'none';
+  document.getElementById('ordersView').style.display = 'block';
+}
+
+async function login(){
+  const rid = document.getElementById('restaurantId').value.trim();
+  const pin = document.getElementById('pin').value.trim();
+  const btn = document.getElementById('loginBtn');
+  const err = document.getElementById('loginErr');
+  err.textContent = '';
+  if(!rid || !pin){ err.textContent = 'Enter both fields'; return; }
+  btn.disabled = true; btn.textContent = 'CHECKING...';
+  try{
+    const res = await fetch(`${BACKEND_URL}/api/staff/login`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({restaurantId: rid, pin})
+    });
+    const data = await res.json();
+    if(!res.ok) throw new Error(data.error || 'Login failed');
+    token = data.token;
+    restaurantId = rid;
+    sessionStorage.setItem('staff_token', token);
+    sessionStorage.setItem('staff_restaurant_id', rid);
+    document.getElementById('restName').textContent = data.restaurantName || 'Orders';
+    showOrders();
+    loadOrders();
+    pollTimer = setInterval(loadOrders, 15000);
+  }catch(e){
+    err.textContent = e.message;
+  }finally{
+    btn.disabled = false; btn.textContent = 'LOG IN';
+  }
+}
+
+function logout(){
+  token = null; restaurantId = null;
+  sessionStorage.removeItem('staff_token');
+  sessionStorage.removeItem('staff_restaurant_id');
+  showLogin();
+}
+
+async function loadOrders(){
+  try{
+    const res = await fetch(`${BACKEND_URL}/api/staff/orders`, {
+      headers:{'Authorization':'Bearer '+token}
+    });
+    if(res.status===401){ showLogin('Session expired - log in again with today\'s PIN.'); return; }
+    const data = await res.json();
+    renderOrders(data.orders||[]);
+    document.getElementById('refreshNote').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  }catch(e){
+    document.getElementById('refreshNote').textContent = 'Could not refresh - retrying...';
+  }
+}
+
+function renderOrders(orders){
+  const el = document.getElementById('ordersList');
+  if(orders.length===0){ el.innerHTML = '<div class="empty">No orders yet today</div>'; return; }
+  el.innerHTML = orders.map(o => {
+    const items = o.items.map(i=>`${i.name} x${i.qty}`).join(', ');
+    const actions = (TRANSITIONS[o.status]||[]).map(([to,label])=>
+      `<button class="small" onclick="updateStatus('${o.code}','${to}')">${label}</button>`
+    ).join('');
+    return `
+      <div class="order">
+        <div class="order-head">
+          <span class="code">${o.code}</span>
+          <span class="status ${o.status}">${o.status}</span>
+        </div>
+        <div class="items">${o.customerName} · ${items} · ₹${o.total}</div>
+        ${actions ? `<div class="actions">${actions}</div>` : ''}
+      </div>`;
+  }).join('');
+}
+
+async function updateStatus(code, to){
+  try{
+    const res = await fetch(`${BACKEND_URL}/api/staff/orders/${code}/status`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+      body: JSON.stringify({to})
+    });
+    if(res.status===401){ showLogin('Session expired - log in again with today\'s PIN.'); return; }
+    const data = await res.json();
+    if(!res.ok){ alert(data.error||'Failed to update'); return; }
+    loadOrders();
+  }catch(e){
+    alert('Network error - try again');
+  }
+}
+
+// Resume session if still valid
+if(token && restaurantId){
+  showOrders();
+  loadOrders();
+  pollTimer = setInterval(loadOrders, 15000);
+}
+</script>
+</body>
+</html>
