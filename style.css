@@ -12,6 +12,10 @@
   --success: #16a34a;
   --radius: 20px;
   --shadow: 0 20px 60px rgba(0,0,0,0.18);
+  /* Default background image — overridden at runtime from the SITE_IMAGES
+     config block at the top of index.html, so you never need to edit this
+     file to change it. */
+  --bg-image: url('./assets/waterfall.webp');
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{
@@ -23,7 +27,7 @@ body{
 }
 .waterfall-bg{
   position:fixed; inset:0;
-  background: url('./assets/waterfall.webp') center/cover no-repeat;
+  background: var(--bg-image) center/cover no-repeat;
   z-index:-3;
 }
 .waterfall-overlay{
@@ -56,7 +60,7 @@ body{
 #startup{
   position:fixed; inset:0; z-index:1000;
   display:flex; align-items:center; justify-content:center;
-  background: url('./assets/waterfall.webp') center/cover;
+  background: var(--bg-image) center/cover;
   transition: opacity 0.8s ease, transform 0.8s ease;
 }
 #startup::after{
@@ -75,6 +79,11 @@ body{
   display:flex; align-items:center; justify-content:center; gap:10px;
 }
 .logo i{ font-style:normal; background: linear-gradient(135deg, #fff, #ffd6a8); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+/* Custom logo image (shown instead of the 🌊 emoji / "F" square once a
+   LOGO_IMAGE file name is set in the SITE_IMAGES config in index.html) */
+.site-logo-img{ display:none; object-fit:cover; }
+#startupLogoImg.site-logo-img{ width:44px; height:44px; border-radius:12px; }
+#brandLogoImg.site-logo-img{ width:36px; height:36px; border-radius:12px; }
 .startup-steps{ margin-top:24px; text-align:left; display:flex; flex-direction:column; gap:12px; }
 .step{ display:flex; align-items:center; gap:12px; font-size:14px; opacity:0.9; }
 .dot{ width:22px;height:22px;border-radius:50%; display:grid; place-items:center; font-size:12px; border:1px solid rgba(255,255,255,0.3); }

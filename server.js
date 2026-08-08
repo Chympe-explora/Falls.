@@ -548,6 +548,7 @@ if(TELEGRAM_BOT_TOKEN){
       [Markup.button.callback('🏪 Profile','r_profile'), Markup.button.callback('🕐 Hours','r_hours')],
       [Markup.button.callback(restaurant.isOpen?'🔴 Close Shop':'🟢 Open Shop','r_toggle_open'), Markup.button.callback(restaurant.isBusy?'🟢 Not Busy':'🟡 Busy Mode','r_toggle_busy')],
       [Markup.button.callback('👥 Staff','r_staff'), Markup.button.callback('📊 Sales','r_sales')],
+      [Markup.button.callback(restaurant.status==='LIVE' ? '🟢 LIVE (tap to re-check)' : '🟢 GO LIVE','r_golive')],
       [Markup.button.callback('⚙️ Settings','r_settings')]
     ]));
   }
@@ -703,11 +704,13 @@ if(TELEGRAM_BOT_TOKEN){
       if(data==='r_toggle_open'){
         restaurant.isOpen = !restaurant.isOpen;
         saveDB();
+        sendBackupToAdmins('update:toggle_open:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
         return ctx.editMessageText(`Shop is now ${restaurant.isOpen?'🟢 OPEN':'🔴 CLOSED'}`);
       }
       if(data==='r_toggle_busy'){
         restaurant.isBusy = !restaurant.isBusy;
         saveDB();
+        sendBackupToAdmins('update:toggle_busy:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
         return ctx.editMessageText(`Busy mode: ${restaurant.isBusy?'🟡 BUSY':'🟢 Not busy'}`);
       }
       if(data==='r_payments'){
@@ -717,6 +720,10 @@ if(TELEGRAM_BOT_TOKEN){
       }
       if(data==='setup_start'){
         return ctx.reply('🏪 SETUP WIZARD\n1️⃣ Profile done\n2️⃣ Hours: send /sethours 10:00-22:00\n3️⃣ Menu: send /additem\n4️⃣ Payment: /setupi\n5️⃣ Delivery fee: /setdelivery\n6️⃣ Then /golive');
+      }
+      if(data==='r_golive'){
+        await ctx.answerCbQuery();
+        return performGoLive(ctx, restaurant);
       }
       if(data==='r_staff'){
         const pin = ensureStaffPin(restaurant);
@@ -763,6 +770,8 @@ if(TELEGRAM_BOT_TOKEN){
     saveDB();
     logAudit('restaurant:'+restaurant.id, 'ADD_ITEM', item.id, null, item);
     ctx.reply(`✅ ITEM ADDED\n${item.name} - ₹${item.price}\nCategory: ${category.name}`, {reply_markup:{inline_keyboard:[[{text:'✏️ EDIT', callback_data:'edit_'+item.id}]]}});
+    // Menu changed -> push the admin a fresh data.json (last step of this command).
+    sendBackupToAdmins('update:additem:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
   });
 
   bot.command('setupi', async (ctx)=>{
@@ -772,6 +781,7 @@ if(TELEGRAM_BOT_TOKEN){
     restaurant.upiId = upi;
     saveDB();
     ctx.reply(`✅ UPI Updated: ${upi}`);
+    sendBackupToAdmins('update:setupi:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
   });
 
   bot.command('sethours', async (ctx)=>{
@@ -781,11 +791,12 @@ if(TELEGRAM_BOT_TOKEN){
     restaurant.openingHours = hours;
     saveDB();
     ctx.reply(`✅ Hours updated: ${hours}`);
+    sendBackupToAdmins('update:sethours:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
   });
 
-  bot.command('golive', async (ctx)=>{
-    const restaurant = findRestaurantByTelegramUser(ctx.from.id);
-    if(!restaurant) return;
+  // Shared by both the /golive text command and the tappable "🟢 GO LIVE"
+  // button, so typing or tapping does exactly the same thing.
+  async function performGoLive(ctx, restaurant){
     const hasMenu = db.menuItems.some(i=>i.restaurantId===restaurant.id);
     const hasPayment = !!restaurant.upiId;
     const hasHours = !!restaurant.openingHours;
@@ -802,6 +813,12 @@ if(TELEGRAM_BOT_TOKEN){
     // goes live — this is the point the data is worth having a fresh copy
     // of, since Render's free tier wipes the disk on restart.
     sendBackupToAdmins('go_live:'+restaurant.name).catch(e=>console.error('go-live backup send failed', e.message));
+  }
+
+  bot.command('golive', async (ctx)=>{
+    const restaurant = findRestaurantByTelegramUser(ctx.from.id);
+    if(!restaurant) return;
+    await performGoLive(ctx, restaurant);
   });
 
   bot.command('setdelivery', async (ctx)=>{
@@ -811,6 +828,7 @@ if(TELEGRAM_BOT_TOKEN){
     restaurant.deliveryFee = fee;
     saveDB();
     ctx.reply(`Delivery fee set to ₹${fee}`);
+    sendBackupToAdmins('update:setdelivery:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
   });
 
   bot.command('staffpin', async (ctx)=>{
@@ -863,6 +881,7 @@ if(TELEGRAM_BOT_TOKEN){
       saveDB();
       logAudit('restaurant:'+restaurant.id, 'UPDATE_QR', restaurant.id);
       ctx.reply('📷 QR RECEIVED\n✅ PAYMENT QR UPDATED\n\nSending any photo here updates your payment QR. Menu item photos will get their own upload flow separately.', {reply_markup:{inline_keyboard:[[{text:'👀 PREVIEW', url: fileLink.href}]]}});
+      sendBackupToAdmins('update:qr:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
     }catch(e){
       ctx.reply('Failed to save QR');
     }
@@ -885,11 +904,9 @@ if(TELEGRAM_BOT_TOKEN){
   if(process.env.NODE_ENV !== 'production'){
     bot.launch().then(()=>console.log('Telegram bot polling started')).catch(e=>console.error('Bot launch failed', e.message));
   }
-  // Auto-backup: send the full db to super admins on startup and every 6h.
-  // If Render wipes the disk on the next restart, reply /restore to the
-  // most recent of these messages to get everything back.
-  setTimeout(()=>sendBackupToAdmins('startup').catch(e=>console.error('backup err', e.message)), 15*1000);
-  setInterval(()=>sendBackupToAdmins('scheduled').catch(e=>console.error('backup err', e.message)), 6*60*60*1000);
+  // No startup/scheduled auto-backup on purpose — per request, data.json is
+  // only pushed to admins on GO LIVE and on a restaurant data update (see
+  // sendBackupToAdmins() call sites below), plus on-demand via /backup.
 } else {
   console.log('TELEGRAM_BOT_TOKEN not set - bot disabled');
   // dummy webhook that just logs
@@ -986,19 +1003,23 @@ async function notifyRestaurantReceipt(order, localFilePath, mimetype){
   }
 }
 
-// Sends the entire db as a .json document to every super admin's Telegram
-// chat. This is the actual fix for "Render wipes the data" - not a daily
-// restaurant login. Reply to the file with /restore to reload it.
+// Sends the entire db to every super admin's Telegram chat as a file named
+// exactly "data.json" — the same name the server itself reads/writes
+// (DATA_FILE) — so it can be dragged straight into backend/data.json in
+// GitHub with no renaming. Only fires on the two triggers the owner asked
+// for: (1) a restaurant going LIVE, and (2) an already-registered restaurant
+// changing any of its info/data (menu, hours, UPI, delivery fee, QR, staff
+// PIN, open/busy toggle). Reply to the file with /restore to reload it.
 async function sendBackupToAdmins(triggeredBy='auto'){
   if(!bot) return;
   if(SUPER_ADMIN_IDS.length===0) return;
   try{
     const buffer = Buffer.from(JSON.stringify(db, null, 2), 'utf8');
-    const filename = `falls-backup-${new Date().toISOString().replace(/[:.]/g,'-')}.json`;
+    const filename = `data.json`;
     for(const adminId of SUPER_ADMIN_IDS){
       try{
         await bot.telegram.sendDocument(adminId, { source: buffer, filename }, {
-          caption: `💾 Backup (${triggeredBy})\nRestaurants: ${db.restaurants.length} | Orders: ${db.orders.length} | Applications: ${db.applications.length}\n\nIf the server data ever resets, reply to THIS file with /restore.`
+          caption: `💾 Updated data.json (${triggeredBy})\nRestaurants: ${db.restaurants.length} | Orders: ${db.orders.length} | Applications: ${db.applications.length}\n\nUpload this file directly over backend/data.json in GitHub to persist it. Reply to THIS file with /restore to reload it into a running server instead.`
         });
       }catch(e){ console.error('backup send failed', adminId, e.message); }
     }

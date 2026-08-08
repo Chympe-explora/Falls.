@@ -6,6 +6,21 @@
 <title>Falls — Premium Food Ordering</title>
 <link rel="stylesheet" href="./style.css"/>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌊</text></svg>">
+
+<!-- ============================================================
+     SITE IMAGES — edit this block only, no other file needs to change.
+     1. Upload your image files into frontend/assets/ in the GitHub repo.
+     2. Type the exact file name (with extension) below.
+     3. Leave a field blank to keep the default (🌊 emoji logo / waterfall
+        background).
+     Example: uploaded frontend/assets/my-logo.png -> LOGO_IMAGE: 'my-logo.png'
+     ============================================================ -->
+<script>
+  window.SITE_IMAGES = {
+    BACKGROUND_IMAGE: 'waterfall.webp',  // file inside frontend/assets/ used as the page background
+    LOGO_IMAGE: ''                       // file inside frontend/assets/ used as the site logo (blank = 🌊 text logo)
+  };
+</script>
 </head>
 <body>
 <div class="waterfall-bg"></div>
@@ -16,7 +31,7 @@
 <!-- STARTUP SCREEN -->
 <div id="startup">
   <div class="startup-card glass">
-    <div class="logo"><span>🌊</span><span><i>FALLS</i><br/><span style="font-size:12px; letter-spacing:0.18em; opacity:0.8; font-family:Outfit">PREMIUM EATS</span></span></div>
+    <div class="logo"><span id="startupLogoEmoji">🌊</span><img id="startupLogoImg" class="site-logo-img"/><span><i>FALLS</i><br/><span style="font-size:12px; letter-spacing:0.18em; opacity:0.8; font-family:Outfit">PREMIUM EATS</span></span></div>
     <p style="margin-top:12px; opacity:0.85; font-size:14px;">Preparing your dining experience...</p>
     <div class="startup-steps" id="startupSteps">
       <div class="step"><span class="dot done">✓</span><span>Website loaded</span></div>
@@ -33,7 +48,8 @@
 <header class="glass" style="border-left:0; border-right:0; border-top:0; border-radius:0;">
   <div class="header-inner">
     <div class="brand" onclick="navigate('home')" style="cursor:pointer;">
-      <span style="width:36px;height:36px;border-radius:12px;background:#fff;color:#000;display:grid;place-items:center;font-family:Fraunces">F</span>
+      <span id="brandLogoLetter" style="width:36px;height:36px;border-radius:12px;background:#fff;color:#000;display:grid;place-items:center;font-family:Fraunces">F</span>
+      <img id="brandLogoImg" class="site-logo-img"/>
       <div><div>FALLS</div><small>Waterfall dining</small></div>
     </div>
     <div class="search-wrap glass" id="searchWrap">
@@ -245,5 +261,27 @@
 </div>
 
 <script src="./app.js"></script>
+<script>
+  // Applies the SITE_IMAGES config above: sets the background image and
+  // swaps the emoji/letter logo for an uploaded image when a file name is
+  // provided. Runs once, immediately — no other file needs editing.
+  (function applySiteImages(){
+    var cfg = window.SITE_IMAGES || {};
+    if(cfg.BACKGROUND_IMAGE){
+      document.documentElement.style.setProperty('--bg-image', `url('./assets/${cfg.BACKGROUND_IMAGE}')`);
+    }
+    if(cfg.LOGO_IMAGE){
+      var src = `./assets/${cfg.LOGO_IMAGE}`;
+      var startupImg = document.getElementById('startupLogoImg');
+      var startupEmoji = document.getElementById('startupLogoEmoji');
+      if(startupImg){ startupImg.src = src; startupImg.style.display = 'block'; }
+      if(startupEmoji){ startupEmoji.style.display = 'none'; }
+      var brandImg = document.getElementById('brandLogoImg');
+      var brandLetter = document.getElementById('brandLogoLetter');
+      if(brandImg){ brandImg.src = src; brandImg.style.display = 'block'; }
+      if(brandLetter){ brandLetter.style.display = 'none'; }
+    }
+  })();
+</script>
 </body>
 </html>
