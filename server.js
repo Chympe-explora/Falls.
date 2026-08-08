@@ -368,6 +368,12 @@ app.post('/api/restaurants/register', async (req,res)=>{
     // Silent admin notification via Telegram
     await notifySuperAdminNewRegistration(appEntry);
 
+    // Send an updated data.json backup to admins right away too — since
+    // Render's free tier wipes the local disk on every restart, this gives
+    // the admin an immediate, current copy to /restore from if the server
+    // resets before the next scheduled 6h backup.
+    sendBackupToAdmins('new_registration:'+appEntry.restaurantName).catch(e=>console.error('registration backup send failed', e.message));
+
     res.json({ok:true, message:'Registration submitted. Awaiting admin approval.', id});
   }catch(e){
     console.error(e);
