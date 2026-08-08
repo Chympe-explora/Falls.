@@ -40,7 +40,8 @@ let db = {
   staff: [],
   auditLogs: [],
   idempotency: {}, // key -> orderCode
-  receipts: []
+  receipts: [],
+  systemPaused: false // platform-wide emergency pause, toggled from the Super Admin bot
 };
 
 function loadDB(){
@@ -397,6 +398,7 @@ app.post('/api/orders', (req,res)=>{
     if(!restaurantId || !customerName || !phone || !items || !items.length){
       return res.status(400).json({error:'Missing fields'});
     }
+    if(db.systemPaused) return res.status(503).json({error:'Ordering is temporarily paused. Please try again shortly.'});
     const restaurant = db.restaurants.find(r=>r.id===restaurantId);
     if(!restaurant || restaurant.status!=='LIVE') return res.status(400).json({error:'Restaurant unavailable'});
     if(!restaurant.isOpen) return res.status(400).json({error:'Restaurant closed'});
@@ -498,6 +500,10 @@ let bot = null;
 if(TELEGRAM_BOT_TOKEN){
   const { Telegraf, Markup } = require('telegraf');
   bot = new Telegraf(TELEGRAM_BOT_TOKEN);
+  // Super admins who tapped "📢 Announcements" and whose next text message
+  // should be broadcast to every live restaurant, instead of being treated
+  // as a normal chat message.
+  const pendingBroadcastAdmins = new Set();
 
   // /start
   bot.start(async (ctx)=>{
@@ -505,12 +511,7 @@ if(TELEGRAM_BOT_TOKEN){
     const tgUserId = ctx.from.id;
 
     if(isSuperAdmin(tgUserId)){
-      return ctx.reply('👑 SUPER ADMIN\nWelcome to Control Center\n\n💾 Data is backed up here automatically every 6h. If it ever resets, reply /restore to the latest backup file. Send /backup anytime for an on-demand copy.', Markup.inlineKeyboard([
-        [Markup.button.callback('🏪 Restaurants','sa_restaurants')],
-        [Markup.button.callback('📦 Orders','sa_orders'), Markup.button.callback('💳 Payments','sa_payments')],
-        [Markup.button.callback('📊 Analytics','sa_analytics'), Markup.button.callback('🩺 System Health','sa_health')],
-        [Markup.button.callback('🚨 Emergency','sa_emergency')]
-      ]));
+      return showSuperAdminMenu(ctx);
     }
 
     if(payload.startsWith('link_')){
@@ -541,6 +542,15 @@ if(TELEGRAM_BOT_TOKEN){
     ctx.reply('👋 Welcome! This bot is for restaurant partners and super admins.\nIf you registered on the website, wait for approval to get linking code.\n\nIf you are a customer, please use the website for orders.');
   });
 
+  function showSuperAdminMenu(ctx){
+    return ctx.reply(`👑 SUPER ADMIN\nWelcome to Control Center\nOrdering: ${db.systemPaused ? '⏸ PAUSED' : '🟢 ACTIVE'}\n\n💾 data.json is sent here automatically whenever a restaurant goes live or updates its info. Send /backup anytime for an on-demand copy. If data ever resets, reply /restore to the latest file.`, Markup.inlineKeyboard([
+      [Markup.button.callback('🏪 Restaurants','sa_restaurants')],
+      [Markup.button.callback('📦 Orders','sa_orders'), Markup.button.callback('💳 Payments','sa_payments')],
+      [Markup.button.callback('📊 Analytics','sa_analytics'), Markup.button.callback('🩺 System Health','sa_health')],
+      [Markup.button.callback('📢 Announcements','sa_announce'), Markup.button.callback('🚨 Emergency','sa_emergency')]
+    ]));
+  }
+
   function showRestaurantMainMenu(ctx, restaurant){
     return ctx.reply(`🏪 RESTAURANT CONTROL\n${restaurant.name}\nStatus: ${restaurant.status} | ${restaurant.isOpen?'🟢 Open':'🔴 Closed'}`, Markup.inlineKeyboard([
       [Markup.button.callback('📦 Orders','r_orders'), Markup.button.callback('🍔 Menu','r_menu')],
@@ -570,13 +580,74 @@ if(TELEGRAM_BOT_TOKEN){
               [Markup.button.callback('👀 VIEW DETAILS','view_'+app.id)]
             ]));
           }
+          return;
         }
         if(data==='sa_health'){
-          return ctx.reply(`🩺 SYSTEM HEALTH\nFrontend: 🟢\nBackend: 🟢\nDatabase: 🟢 ${db.restaurants.length} restaurants\nTelegram: 🟢\nOrders today: ${db.orders.filter(o=>o.createdAt.startsWith(new Date().toISOString().slice(0,10))).length}`);
+          return ctx.reply(`🩺 SYSTEM HEALTH\nFrontend: 🟢\nBackend: 🟢\nDatabase: 🟢 ${db.restaurants.length} restaurants\nTelegram: 🟢\nOrdering: ${db.systemPaused ? '⏸ PAUSED' : '🟢 ACTIVE'}\nOrders today: ${db.orders.filter(o=>o.createdAt.startsWith(todayStr())).length}`);
         }
         if(data==='sa_orders'){
           const recent = db.orders.slice(-5).reverse();
-          return ctx.reply('📦 Recent Orders:\n'+recent.map(o=>`${o.code} - ${o.total} - ${o.status}`).join('\n'));
+          if(recent.length===0) return ctx.reply('📦 No orders yet');
+          return ctx.reply('📦 Recent Orders:\n'+recent.map(o=>`${o.code} - ₹${o.total} - ${o.status}`).join('\n'));
+        }
+        if(data==='sa_payments'){
+          const totalRevenue = db.orders.filter(o=>o.status==='COMPLETED').reduce((s,o)=>s+o.total,0);
+          const pendingVerification = db.orders.filter(o=>o.paymentStatus==='RECEIPT_SUBMITTED').length;
+          const liveRestaurants = db.restaurants.filter(r=>r.status==='LIVE');
+          const missingUpi = liveRestaurants.filter(r=>!r.upiId);
+          return ctx.reply(`💳 PAYMENTS OVERVIEW\n\nTotal revenue (completed orders): ₹${totalRevenue}\nReceipts awaiting verification: ${pendingVerification}\nLive restaurants missing a UPI ID: ${missingUpi.length}${missingUpi.length ? '\n' + missingUpi.slice(0,10).map(r=>'• '+r.name).join('\n') : ''}`);
+        }
+        if(data==='sa_analytics'){
+          const today = todayStr();
+          const ordersToday = db.orders.filter(o=>o.createdAt.startsWith(today));
+          const revenueToday = ordersToday.reduce((s,o)=>s+o.total,0);
+          const weekAgoIso = new Date(Date.now()-7*24*60*60*1000).toISOString();
+          const ordersWeek = db.orders.filter(o=>o.createdAt >= weekAgoIso);
+          const counts = {};
+          ordersWeek.forEach(o=>{ counts[o.restaurantId] = (counts[o.restaurantId]||0)+1; });
+          const top = Object.entries(counts).sort((a,b)=>b[1]-a[1]).slice(0,3)
+            .map(([rid,c])=>{ const r = db.restaurants.find(x=>x.id===rid); return `${r ? r.name : 'Unknown'} — ${c} orders`; });
+          const avgOrder = ordersWeek.length ? Math.round(ordersWeek.reduce((s,o)=>s+o.total,0)/ordersWeek.length) : 0;
+          return ctx.reply(`📊 ANALYTICS\n\nToday: ${ordersToday.length} orders, ₹${revenueToday}\nLast 7 days: ${ordersWeek.length} orders, avg ₹${avgOrder}/order\n\nTop restaurants (7d):\n${top.join('\n') || 'No orders yet'}`);
+        }
+        if(data==='sa_announce'){
+          pendingBroadcastAdmins.add(tgUserId);
+          return ctx.reply('📢 Send the announcement text now and I\'ll deliver it to every live restaurant\'s Telegram.\n\nSend /cancel to abort instead.');
+        }
+        if(data==='sa_emergency'){
+          return ctx.reply(`🚨 EMERGENCY CONTROLS\nOrdering is currently: ${db.systemPaused ? '⏸ PAUSED' : '🟢 ACTIVE'}`, Markup.inlineKeyboard([
+            [Markup.button.callback(db.systemPaused ? '▶️ RESUME ORDERING' : '⏸ PAUSE ALL ORDERING','sa_toggle_pause')],
+            [Markup.button.callback('🚫 Suspend / unsuspend a restaurant','sa_suspend_list')],
+            [Markup.button.callback('◀️ Back','sa_back')]
+          ]));
+        }
+        if(data==='sa_toggle_pause'){
+          db.systemPaused = !db.systemPaused;
+          saveDB();
+          logAudit('superadmin:'+tgUserId, db.systemPaused ? 'PAUSE_ORDERING' : 'RESUME_ORDERING', 'platform');
+          return ctx.editMessageText(`Ordering is now ${db.systemPaused ? '⏸ PAUSED — customers cannot place new orders' : '🟢 ACTIVE again'}`);
+        }
+        if(data==='sa_suspend_list'){
+          const candidates = db.restaurants.filter(r=>r.status==='LIVE' || r.status==='SUSPENDED').slice(0,10);
+          if(candidates.length===0) return ctx.reply('No live restaurants to suspend.');
+          return ctx.reply('Tap a restaurant to suspend or unsuspend it:', Markup.inlineKeyboard(
+            candidates.map(r=>[Markup.button.callback(`${r.status==='SUSPENDED' ? '🚫 (suspended) ' : '🟢 '}${r.name}`, 'sa_suspend_'+r.id)])
+          ));
+        }
+        if(data.startsWith('sa_suspend_')){
+          const rid = data.replace('sa_suspend_','');
+          const r = db.restaurants.find(x=>x.id===rid);
+          if(!r) return ctx.answerCbQuery('Not found');
+          if(r.status==='SUSPENDED'){ r.status='LIVE'; }
+          else if(r.status==='LIVE'){ r.status='SUSPENDED'; }
+          else { return ctx.answerCbQuery('Restaurant is not live'); }
+          saveDB();
+          logAudit('superadmin:'+tgUserId, r.status==='SUSPENDED' ? 'SUSPEND_RESTAURANT' : 'UNSUSPEND_RESTAURANT', r.id);
+          sendBackupToAdmins((r.status==='SUSPENDED' ? 'suspend:' : 'unsuspend:')+r.name).catch(e=>console.error('backup send failed', e.message));
+          return ctx.editMessageText(`${r.name} is now ${r.status==='SUSPENDED' ? '🚫 SUSPENDED (hidden from customers, no new orders)' : '🟢 LIVE again'}`);
+        }
+        if(data==='sa_back'){
+          return showSuperAdminMenu(ctx);
         }
         return ctx.answerCbQuery();
       }
@@ -868,6 +939,37 @@ if(TELEGRAM_BOT_TOKEN){
     }catch(e){
       ctx.reply('❌ Restore failed: '+e.message);
     }
+  });
+
+  bot.command('cancel', async (ctx)=>{
+    if(pendingBroadcastAdmins.has(ctx.from.id)){
+      pendingBroadcastAdmins.delete(ctx.from.id);
+      return ctx.reply('❌ Announcement cancelled.');
+    }
+    return ctx.reply('Nothing to cancel.');
+  });
+
+  // Any plain text from a super admin who just tapped "📢 Announcements" is
+  // treated as the announcement body and broadcast to every live
+  // restaurant's linked Telegram account(s). Registered after every
+  // bot.command(...) above, so commands (which start with '/') are always
+  // handled by their own handler first and never reach here.
+  bot.on('text', async (ctx)=>{
+    const tgUserId = ctx.from.id;
+    if(!isSuperAdmin(tgUserId) || !pendingBroadcastAdmins.has(tgUserId)) return;
+    pendingBroadcastAdmins.delete(tgUserId);
+    const text = ctx.message.text;
+    const liveRestaurants = db.restaurants.filter(r=>r.status==='LIVE');
+    const accounts = db.telegramAccounts.filter(a=> liveRestaurants.some(r=>r.id===a.restaurantId));
+    let sent = 0;
+    for(const acc of accounts){
+      try{
+        await withRetries(()=> bot.telegram.sendMessage(acc.telegramUserId, `📢 ANNOUNCEMENT FROM FALLS\n\n${text}`));
+        sent++;
+      }catch(e){ console.error('announcement send failed', acc.telegramUserId, e.message); }
+    }
+    logAudit('superadmin:'+tgUserId, 'BROADCAST_ANNOUNCEMENT', 'platform', null, {text, sent});
+    ctx.reply(`✅ Announcement sent to ${sent} of ${accounts.length} restaurant contact(s).`);
   });
 
   bot.on('photo', async (ctx)=>{
