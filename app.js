@@ -8,6 +8,8 @@ let restaurants = [];
 let currentRestaurant = null;
 let cart = JSON.parse(localStorage.getItem('cart')||'[]');
 let currentOrderCode = null;
+let checkoutIdempotencyKey = null;
+let placingOrder = false;
 let backendReady = false;
 
 const $ = s=>document.querySelector(s);
@@ -289,6 +291,10 @@ function closeCart(){ $('#cartModal').classList.remove('show'); }
 function openCheckout(){
   if(!currentRestaurant) return;
   if(!cart.length) return alert('Cart empty');
+  // One key per checkout attempt (not per tap) - lets retries/double-taps
+  // for THIS cart collapse into a single order on the backend, while a
+  // genuinely new order (next time openCheckout runs) gets a fresh key.
+  checkoutIdempotencyKey = 'order_'+Date.now()+'_'+Math.random().toString(36).slice(2);
   $('#checkoutRestaurantName').textContent = currentRestaurant.name;
   $('#checkoutModal').classList.add('show');
   showCheckoutStep(1);
@@ -322,7 +328,11 @@ function goToPayment(){
   showCheckoutStep(2);
 }
 async function placeOrder(){
-  const idempotencyKey = 'order_'+Date.now()+'_'+Math.random().toString(36).slice(2);
+  if(placingOrder) return; // ignore extra taps while a request is already in flight
+  placingOrder = true;
+  const payBtn = document.querySelector('#checkoutStep2 .btn-primary');
+  if(payBtn){ payBtn.disabled = true; payBtn.textContent = 'Placing order...'; }
+  const idempotencyKey = checkoutIdempotencyKey;
   const payload = {
     restaurantId: currentRestaurant.id,
     customerName: $('#cName').value.trim(),
@@ -353,9 +363,13 @@ async function placeOrder(){
     $('#orderCodeOut').textContent = data.code;
     showCheckoutStep(3);
     cart=[]; saveCart();
+    checkoutIdempotencyKey = null; // this cart's order is done; next checkout gets a fresh key
     // polling for tracking not needed here
   }catch(e){
     alert('Order failed: '+e.message);
+  }finally{
+    placingOrder = false;
+    if(payBtn){ payBtn.disabled = false; payBtn.textContent = 'Pay & Place Order →'; }
   }
 }
 function trackFromCheckout(){
