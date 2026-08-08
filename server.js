@@ -1054,6 +1054,86 @@ app.post('/api/admin/restaurants/:id/highlight', requireAdminKey, (req,res)=>{
   res.json(publicRestaurant(r));
 });
 
+app.post('/api/admin/restaurants/:id/premium', requireAdminKey, (req,res)=>{
+  const r = db.restaurants.find(x=>x.id===req.params.id);
+  if(!r) return res.status(404).json({error:'Not found'});
+  r.premium = !r.premium;
+  saveDB();
+  logAudit('superadmin', r.premium?'MAKE_PREMIUM':'REMOVE_PREMIUM', r.id);
+  res.json(publicRestaurant(r));
+});
+
+app.post('/api/admin/restaurants/:id/suspend', requireAdminKey, (req,res)=>{
+  const r = db.restaurants.find(x=>x.id===req.params.id);
+  if(!r) return res.status(404).json({error:'Not found'});
+  r.status = r.status==='SUSPENDED' ? 'LIVE' : 'SUSPENDED';
+  saveDB();
+  logAudit('superadmin', r.status==='SUSPENDED'?'SUSPEND':'UNSUSPEND', r.id);
+  res.json(publicRestaurant(r));
+});
+
+app.patch('/api/admin/restaurants/:id', requireAdminKey, (req,res)=>{
+  const r = db.restaurants.find(x=>x.id===req.params.id);
+  if(!r) return res.status(404).json({error:'Not found'});
+  const allowed = ['deliveryFee','minOrder','commissionRate','openingHours','cuisine','city'];
+  const prev = {};
+  const next = {};
+  for(const key of allowed){
+    if(req.body[key] !== undefined){
+      prev[key] = r[key];
+      r[key] = req.body[key];
+      next[key] = req.body[key];
+    }
+  }
+  saveDB();
+  logAudit('superadmin', 'UPDATE_RESTAURANT', r.id, prev, next);
+  res.json(publicRestaurant(r));
+});
+
+// ---- ADMIN: APPLICATION APPROVAL (mirrors Telegram approve_/reject_ flow) ----
+app.post('/api/admin/applications/:id/approve', requireAdminKey, (req,res)=>{
+  const application = db.applications.find(a=>a.id===req.params.id);
+  if(!application) return res.status(404).json({error:'Not found'});
+  if(application.status !== 'PENDING') return res.status(409).json({error:'Application already '+application.status});
+  application.status = 'APPROVED';
+  const restaurant = db.restaurants.find(r=>r.id===application.id);
+  if(restaurant) restaurant.status = 'APPROVED';
+  const token = uuidv4().replace(/-/g,'').slice(0,16);
+  db.telegramLinks.push({token, restaurantId: application.id, used:false, createdAt:new Date().toISOString()});
+  saveDB();
+  logAudit('superadmin:webdashboard', 'APPROVE_RESTAURANT', application.id);
+  const botUsername = process.env.TELEGRAM_BOT_USERNAME || 'YourBot';
+  res.json({ ok:true, application, linkUrl: `https://t.me/${botUsername}?start=link_${token}` });
+});
+
+app.post('/api/admin/applications/:id/reject', requireAdminKey, (req,res)=>{
+  const application = db.applications.find(a=>a.id===req.params.id);
+  if(!application) return res.status(404).json({error:'Not found'});
+  if(application.status !== 'PENDING') return res.status(409).json({error:'Application already '+application.status});
+  application.status = 'REJECTED';
+  const restaurant = db.restaurants.find(r=>r.id===application.id);
+  if(restaurant) restaurant.status = 'REJECTED';
+  saveDB();
+  logAudit('superadmin:webdashboard', 'REJECT_RESTAURANT', application.id);
+  res.json({ ok:true, application });
+});
+
+// ---- ADMIN: ANALYTICS ----
+app.get('/api/admin/analytics', requireAdminKey, (req,res)=>{
+  const totalOrders = db.orders.length;
+  const totalRevenue = db.orders.reduce((s,o)=> s + (o.status==='COMPLETED' ? (o.total||0) : 0), 0);
+  const activeRestaurants = db.restaurants.filter(r=>r.status==='LIVE').length;
+  const pendingApplications = db.applications.filter(a=>a.status==='PENDING').length;
+  const uniqueCustomers = new Set(db.orders.map(o=>o.phone)).size;
+  const todayStr = new Date().toISOString().slice(0,10);
+  const ordersToday = db.orders.filter(o=> (o.createdAt||'').slice(0,10)===todayStr).length;
+  res.json({
+    totalOrders, totalRevenue, activeRestaurants, pendingApplications,
+    totalCustomers: uniqueCustomers, ordersToday,
+    restaurantsTotal: db.restaurants.length
+  });
+});
+
 // ---- DAILY STAFF PIN ROTATION ----
 // Auto-rotates every restaurant's staff PIN at local midnight (server time)
 // and DMs the new PIN to each linked owner. Owners can also force an early

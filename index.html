@@ -106,6 +106,38 @@
       <p style="margin-top:10px; color:#475569;">FALLS is an original premium food-ordering platform inspired by the calm of a waterfall — not a copy of any existing brand. Built with GitHub Pages frontend, Render backend, Telegram as restaurant control center, and WhatsApp for support.</p>
     </div>
   </section>
+
+  <!-- SUPER ADMIN DASHBOARD -->
+  <section id="page-admin" class="hide">
+    <div id="adminLoginGate" class="glass-strong" style="border-radius:24px; padding:24px;">
+      <h3>👑 Super Admin</h3>
+      <p style="margin-top:8px; color:#475569; font-size:13px;">Enter your admin key (set as <code>ADMIN_API_KEY</code> on the backend). This unlocks restaurant management, application approvals and analytics for this browser session only.</p>
+      <div class="field" style="margin-top:14px;"><label>Admin key</label><input id="adminKeyInput" type="password" placeholder="X-Admin-Key"/></div>
+      <button class="btn btn-primary" style="width:100%; margin-top:12px; background:#0f172a; color:#fff;" onclick="adminLogin()">Unlock dashboard →</button>
+    </div>
+
+    <div id="adminPanel" style="display:none;">
+      <div class="glass-strong" style="border-radius:24px; padding:20px; margin-bottom:16px; display:flex; justify-content:space-between; align-items:center;">
+        <h3 style="font-family:Fraunces;">👑 Super Admin Dashboard</h3>
+        <button class="btn btn-ghost" style="color:#000;border-color:#e2e8f0;" onclick="adminLogout()">Log out</button>
+      </div>
+
+      <div class="glass-strong" style="border-radius:24px; padding:20px; margin-bottom:16px;">
+        <h4 style="margin-bottom:12px;">📊 Analytics</h4>
+        <div id="adminAnalyticsGrid" style="display:grid; grid-template-columns:repeat(2,1fr); gap:10px;"></div>
+      </div>
+
+      <div class="glass-strong" style="border-radius:24px; padding:20px; margin-bottom:16px;">
+        <h4 style="margin-bottom:12px;">📥 Pending Applications</h4>
+        <div id="adminApplicationsList" style="display:grid; gap:10px;"></div>
+      </div>
+
+      <div class="glass-strong" style="border-radius:24px; padding:20px; margin-bottom:16px;">
+        <h4 style="margin-bottom:12px;">🏬 Restaurants</h4>
+        <div id="adminRestaurantsList" style="display:grid; gap:10px;"></div>
+      </div>
+    </div>
+  </section>
 </main>
 
 <!-- CART BAR -->
@@ -180,6 +212,7 @@
       <a href="#" onclick="openHelp(); closeDrawer(); return false;">🆘 Need Help</a>
       <a href="#" onclick="closeDrawer(); alert('Terms: Use fairly, no spam, payments verified by restaurants.'); return false;">📄 Terms</a>
       <a href="#" onclick="closeDrawer(); alert('Privacy: We store only needed order data.'); return false;">🔒 Privacy</a>
+      <a href="#" style="opacity:0.55; font-size:12px; margin-top:10px;" onclick="navigate('admin'); closeDrawer(); return false;">👑 Super Admin</a>
     </div>
     <div style="margin-top:22px; padding:14px; border-radius:16px; background:#f8fafc; font-size:13px; color:#475569;">
       Backend: <span id="backendStatus">checking...</span><br/>

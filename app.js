@@ -410,10 +410,11 @@ function openWhatsAppSupport(code){
 
 // NAVIGATION
 function navigate(page){
-  ['home','restaurant','tracking','about'].forEach(p=>{
+  ['home','restaurant','tracking','about','admin'].forEach(p=>{
     $('#page-'+p).classList.toggle('hide', p!==page);
   });
   if(page==='home') window.scrollTo({top:0, behavior:'smooth'});
+  if(page==='admin') initAdminPage();
 }
 
 // DRAWER
@@ -451,6 +452,128 @@ async function submitRestaurantRegister(){
     alert('Registration submitted! Awaiting admin approval via Telegram (silent notification). You will get linking code after approval.');
     closeRegister();
   }catch(e){ alert('Failed: '+e.message); }
+}
+
+// ===== SUPER ADMIN DASHBOARD =====
+// Auth: a server-verified key (ADMIN_API_KEY env var on the backend), never a
+// client-side PIN. The key lives only in sessionStorage (cleared when the tab
+// closes) and is sent as the X-Admin-Key header on every admin request.
+function adminHeaders(){
+  return { 'Content-Type':'application/json', 'X-Admin-Key': sessionStorage.getItem('admin_key')||'' };
+}
+function initAdminPage(){
+  const key = sessionStorage.getItem('admin_key');
+  if(key){
+    $('#adminLoginGate').style.display = 'none';
+    $('#adminPanel').style.display = 'block';
+    loadAdminData();
+  } else {
+    $('#adminLoginGate').style.display = 'block';
+    $('#adminPanel').style.display = 'none';
+  }
+}
+async function adminLogin(){
+  const key = $('#adminKeyInput').value.trim();
+  if(!key) return alert('Enter the admin key');
+  try{
+    const res = await fetch(`${BACKEND_URL}/api/admin/restaurants`, { headers: {'X-Admin-Key': key} });
+    if(!res.ok){
+      if(res.status===401) return alert('Invalid admin key');
+      if(res.status===503) return alert('Admin API not enabled on the backend yet — set ADMIN_API_KEY in Render env vars');
+      return alert('Login failed ('+res.status+')');
+    }
+    sessionStorage.setItem('admin_key', key);
+    $('#adminKeyInput').value='';
+    initAdminPage();
+  }catch(e){ alert('Could not reach backend: '+e.message); }
+}
+function adminLogout(){
+  sessionStorage.removeItem('admin_key');
+  initAdminPage();
+}
+async function loadAdminData(){
+  try{
+    const [analyticsRes, dataRes] = await Promise.all([
+      fetch(`${BACKEND_URL}/api/admin/analytics`, { headers: adminHeaders() }),
+      fetch(`${BACKEND_URL}/api/admin/restaurants`, { headers: adminHeaders() })
+    ]);
+    if(analyticsRes.status===401 || dataRes.status===401){ alert('Session expired, please log in again'); return adminLogout(); }
+    const analytics = await analyticsRes.json();
+    const data = await dataRes.json();
+    renderAdminAnalytics(analytics);
+    renderAdminApplications(data.applications||[]);
+    renderAdminRestaurants(data.restaurants||[]);
+  }catch(e){ console.error(e); }
+}
+function renderAdminAnalytics(a){
+  const cards = [
+    ['Orders today', a.ordersToday],
+    ['Total orders', a.totalOrders],
+    ['Revenue (completed)', '₹'+(a.totalRevenue||0)],
+    ['Active restaurants', a.activeRestaurants],
+    ['Pending applications', a.pendingApplications],
+    ['Unique customers', a.totalCustomers]
+  ];
+  $('#adminAnalyticsGrid').innerHTML = cards.map(([label,val])=>`
+    <div style="background:#f8fafc; border-radius:14px; padding:14px;">
+      <div style="font-size:12px; color:#64748b;">${label}</div>
+      <div style="font-size:20px; font-weight:800; margin-top:4px;">${val}</div>
+    </div>`).join('');
+}
+function renderAdminApplications(list){
+  const pending = list.filter(a=>a.status==='PENDING');
+  if(!pending.length){ $('#adminApplicationsList').innerHTML = '<div style="font-size:13px; color:#64748b;">No pending applications</div>'; return; }
+  $('#adminApplicationsList').innerHTML = pending.map(a=>`
+    <div style="background:#f8fafc; border-radius:14px; padding:12px;">
+      <div style="font-weight:700;">${a.restaurantName}</div>
+      <div style="font-size:12px; color:#64748b; margin-top:2px;">${a.ownerName} • ${a.phone} • ${a.email}</div>
+      <div style="display:flex; gap:8px; margin-top:10px;">
+        <button class="btn btn-primary" style="background:#16a34a; color:#fff; padding:6px 14px; font-size:13px;" onclick="adminApprove('${a.id}')">✅ Approve</button>
+        <button class="btn btn-ghost" style="color:#000; border-color:#e2e8f0; padding:6px 14px; font-size:13px;" onclick="adminReject('${a.id}')">❌ Reject</button>
+      </div>
+    </div>`).join('');
+}
+function renderAdminRestaurants(list){
+  if(!list.length){ $('#adminRestaurantsList').innerHTML = '<div style="font-size:13px; color:#64748b;">No restaurants yet</div>'; return; }
+  $('#adminRestaurantsList').innerHTML = list.map(r=>`
+    <div style="background:#f8fafc; border-radius:14px; padding:12px;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div>
+          <div style="font-weight:700;">${r.name}</div>
+          <div style="font-size:12px; color:#64748b;">${r.status} • ${r.city||''} • ${r.isOpen?'🟢 Open':'🔴 Closed'}</div>
+        </div>
+      </div>
+      <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:10px;">
+        <button class="btn btn-ghost" style="padding:5px 10px; font-size:12px; color:#000; border-color:${r.isPinned?'#0084ff':'#e2e8f0'};" onclick="adminToggle('${r.id}','pin')">📌 ${r.isPinned?'Unpin':'Pin'}</button>
+        <button class="btn btn-ghost" style="padding:5px 10px; font-size:12px; color:#000; border-color:${r.isHighlighted?'#0084ff':'#e2e8f0'};" onclick="adminToggle('${r.id}','highlight')">✨ ${r.isHighlighted?'Unhighlight':'Highlight'}</button>
+        <button class="btn btn-ghost" style="padding:5px 10px; font-size:12px; color:#000; border-color:${r.premium?'#0084ff':'#e2e8f0'};" onclick="adminToggle('${r.id}','premium')">⭐ ${r.premium?'Remove premium':'Make premium'}</button>
+        <button class="btn btn-ghost" style="padding:5px 10px; font-size:12px; color:${r.status==='SUSPENDED'?'#ff4d5a':'#000'}; border-color:#e2e8f0;" onclick="adminToggle('${r.id}','suspend')">${r.status==='SUSPENDED'?'▶️ Unsuspend':'⛔ Suspend'}</button>
+      </div>
+    </div>`).join('');
+}
+async function adminToggle(id, action){
+  try{
+    const res = await fetch(`${BACKEND_URL}/api/admin/restaurants/${id}/${action}`, { method:'POST', headers: adminHeaders() });
+    if(!res.ok) throw new Error('Action failed');
+    loadAdminData();
+  }catch(e){ alert('Error: '+e.message); }
+}
+async function adminApprove(appId){
+  try{
+    const res = await fetch(`${BACKEND_URL}/api/admin/applications/${appId}/approve`, { method:'POST', headers: adminHeaders() });
+    const data = await res.json();
+    if(!res.ok) throw new Error(data.error||'Approve failed');
+    alert('Approved! Send this Telegram link to the restaurant owner:\n'+data.linkUrl);
+    loadAdminData();
+  }catch(e){ alert('Error: '+e.message); }
+}
+async function adminReject(appId){
+  if(!confirm('Reject this application?')) return;
+  try{
+    const res = await fetch(`${BACKEND_URL}/api/admin/applications/${appId}/reject`, { method:'POST', headers: adminHeaders() });
+    if(!res.ok) throw new Error('Reject failed');
+    loadAdminData();
+  }catch(e){ alert('Error: '+e.message); }
 }
 
 // ORDER PAGE via URL ?code=
@@ -494,3 +617,8 @@ window.submitRestaurantRegister = submitRestaurantRegister;
 window.openHelp = openHelp;
 window.scrollToCat = scrollToCat;
 window.showCheckoutStep = showCheckoutStep;
+window.adminLogin = adminLogin;
+window.adminLogout = adminLogout;
+window.adminToggle = adminToggle;
+window.adminApprove = adminApprove;
+window.adminReject = adminReject;
