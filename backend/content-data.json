@@ -5802,5 +5802,14 @@
   ],
   "categories": [],
   "menuItems": [],
-  "pendingChanges": []
+  "pendingChanges": [],
+  "telegramAccounts": [],
+  "telegramLinks": [
+    {
+      "token": "2956a8ac084349bb",
+      "restaurantId": "rest-001",
+      "used": false,
+      "createdAt": "2026-08-09T06:46:58.469Z"
+    }
+  ]
 }
