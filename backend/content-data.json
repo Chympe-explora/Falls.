@@ -5819,7 +5819,7 @@
       "name": "/additem Jadohsnam",
       "description": "/additem Jadohsnam - delicious, freshly made.",
       "price": 150,
-      "imageUrl": "https://picsum.photos/seed/1786258361848/400/300",
+      "imageUrl": "https://api.telegram.org/file/bot8600517609:AAHByjxL106hvjjPJzKKRw52vMpvvbyvK8o/photos/file_0.jpg",
       "isVeg": false,
       "isAvailable": true,
       "prepTime": "15-20 min",
