@@ -462,6 +462,25 @@ function applyPendingChange(change){
   saveDB();
   return {ok:true};
 }
+// Restaurant-submitted menu changes (add item / price / item image) now go
+// live INSTANTLY - no Super Admin approval step. This reuses the exact same
+// apply logic as the old pendingChanges flow, just without the queue/wait.
+// Auto-syncs to GitHub (if configured) and sends the admin a live-update
+// notice with a manual "Force Sync Now" button as a safety net, in case the
+// automatic sync ever fails silently.
+function applyContentChangeAndNotify(restaurant, type, payload, summary){
+  const result = applyPendingChange({restaurantId:restaurant.id, type, payload});
+  if(!result.ok) return result;
+  logAudit('restaurant:'+restaurant.id, 'DIRECT_CHANGE_'+type, restaurant.id, null, payload);
+  persistContentChange('direct:'+type.toLowerCase()+':'+restaurant.code).catch(e=>console.error('backup send failed', e.message));
+  if(bot && SUPER_ADMIN_IDS.length){
+    const text = `✅ LIVE UPDATE\n[${restaurant.code}] ${restaurant.name}\n\n${summary}\n\nAlready live on the website - synced to GitHub automatically.`;
+    for(const adminId of SUPER_ADMIN_IDS){
+      bot.telegram.sendMessage(adminId, text, {reply_markup:{inline_keyboard:[[{text:'🔄 Force Sync Now', callback_data:'force_sync'}]]}}).catch(e=>console.error('notify failed', e.message));
+    }
+  }
+  return result;
+}
 function findRestaurantByTelegramUser(telegramUserId){
   const acc = db.telegramAccounts.find(a=>a.telegramUserId===Number(telegramUserId));
   if(!acc) return null;
@@ -860,7 +879,7 @@ if(TELEGRAM_BOT_TOKEN){
   });
 
   function showSuperAdminMenu(ctx){
-    return ctx.reply(`👑 SUPER ADMIN\nWelcome to Control Center\nOrdering: ${db.systemPaused ? '⏸ PAUSED' : '🟢 ACTIVE'}\nSlots used: ${db.restaurants.filter(r=>r.status!=='DRAFT').length}/${TOTAL_RESTAURANT_SLOTS}\n\n👁 VISIBILITY: /show 001 makes restaurant 001 visible on the website, /hide 001 hides it. This is the only way a restaurant becomes visible - required even after it goes LIVE.\n\n✏️ PENDING EDITS: /pending lists menu/price/image changes submitted by restaurants that are waiting for your approval before they go live.\n\n⭐ DASHBOARD POWERS (now here too, apply instantly, no approval needed since you ARE the admin):\n/pin <code> - toggle pinned\n/highlight <code> - toggle highlighted\n/premium <code> - toggle premium\n/editinfo <code> | field=value | ... - edit name/description/deliveryFee/minOrder/commissionRate/openingHours/cuisine/city\n/logo <code> then send photo - set restaurant logo\n/cover <code> then send photo - set restaurant cover\n/items <code> - list a restaurant's items with numbers\n/edititem <code> <number> | field=value | ... - edit name/price/description/isAvailable/isVeg\n/adminitemimage <code> <number> then send photo - set item image\n/relink <code> - generate a fresh Telegram link for an already-approved restaurant (fixes a broken/lost link without re-registering)\n\n💾 data.json is sent here automatically whenever a restaurant goes live or updates its info. Send /backup anytime for an on-demand copy. If data ever resets, reply /restore to the latest file.`, Markup.inlineKeyboard([
+    return ctx.reply(`👑 SUPER ADMIN\nWelcome to Control Center\nOrdering: ${db.systemPaused ? '⏸ PAUSED' : '🟢 ACTIVE'}\nSlots used: ${db.restaurants.filter(r=>r.status!=='DRAFT').length}/${TOTAL_RESTAURANT_SLOTS}\n\n👁 VISIBILITY: restaurants now become visible automatically the moment they /golive - no manual step needed. You can still /hide 001 to pull one down, or /show 001 to bring it back.\n\n✏️ LIVE UPDATES: menu/price/image changes restaurants submit now go live instantly - you just get a notified with a 🔄 Force Sync Now button as a backup trigger. /pending still exists for any old queued changes.\n\n⭐ DASHBOARD POWERS (now here too, apply instantly, no approval needed since you ARE the admin):\n/pin <code> - toggle pinned\n/highlight <code> - toggle highlighted\n/premium <code> - toggle premium\n/editinfo <code> | field=value | ... - edit name/description/deliveryFee/minOrder/commissionRate/openingHours/cuisine/city\n/logo <code> then send photo - set restaurant logo\n/cover <code> then send photo - set restaurant cover\n/items <code> - list a restaurant's items with numbers\n/edititem <code> <number> | field=value | ... - edit name/price/description/isAvailable/isVeg\n/adminitemimage <code> <number> then send photo - set item image\n/relink <code> - generate a fresh Telegram link for an already-approved restaurant (fixes a broken/lost link without re-registering)\n\n💾 data.json is sent here automatically whenever a restaurant goes live or updates its info. Send /backup anytime for an on-demand copy. If data ever resets, reply /restore to the latest file.`, Markup.inlineKeyboard([
       [Markup.button.callback('🏪 Restaurants','sa_restaurants')],
       [Markup.button.callback('📦 Orders','sa_orders'), Markup.button.callback('💳 Payments','sa_payments')],
       [Markup.button.callback('📊 Analytics','sa_analytics'), Markup.button.callback('🩺 System Health','sa_health')],
@@ -886,6 +905,12 @@ if(TELEGRAM_BOT_TOKEN){
     const data = ctx.callbackQuery.data;
     const tgUserId = ctx.from.id;
     try{
+      if(data==='force_sync'){
+        if(!isSuperAdmin(tgUserId)) return ctx.answerCbQuery('Unauthorized');
+        await ctx.answerCbQuery('Syncing...');
+        await persistContentChange('manual_force_sync:'+tgUserId);
+        return ctx.reply('💾 Synced current restaurants/menu/links to GitHub + sent you a fresh backup file.');
+      }
       // SUPER ADMIN
       if(data.startsWith('sa_')){
         if(!isSuperAdmin(tgUserId)) return ctx.answerCbQuery('Unauthorized');
@@ -1220,7 +1245,7 @@ if(TELEGRAM_BOT_TOKEN){
       if(data==='r_menu'){
         const cats = db.categories.filter(c=>c.restaurantId===restaurant.id);
         const items = db.menuItems.filter(i=>i.restaurantId===restaurant.id);
-        return ctx.reply(`🍔 MENU - ${items.length} items in ${cats.length} categories\nUse commands:\n/additem Name | Price | Category\n/myitems - list with numbers\n/setprice <number> <new price>\n/itemimage <number> (then send a photo)\n/mycats - list categories\n/renamecat <number> <new name> - goes live instantly\n/reordercat <numbers in new order> - goes live instantly\n\nItems/prices/images go to admin for approval first. Category renames/reorders go live immediately (admin is notified and can override).`, Markup.inlineKeyboard([
+        return ctx.reply(`🍔 MENU - ${items.length} items in ${cats.length} categories\nUse commands:\n/additem Name | Price | Category\n/myitems - list with numbers\n/setprice <number> <new price>\n/itemimage <number> (then send a photo)\n/mycats - list categories\n/renamecat <number> <new name> - goes live instantly\n/reordercat <numbers in new order> - goes live instantly\n\nEverything above goes live on the website instantly - admin is just notified, no approval wait.`, Markup.inlineKeyboard([
           [Markup.button.callback('➕ ADD ITEM','r_add_item')],
           [Markup.button.callback('👀 VIEW MENU','r_view_menu')]
         ]));
@@ -1277,8 +1302,8 @@ if(TELEGRAM_BOT_TOKEN){
     const [name, priceStr, catName] = parts;
     const price = Number(priceStr);
     if(!name || !Number.isFinite(price) || price<=0) return ctx.reply('❌ Invalid name or price. Example: /additem Chicken Burger | 250 | Burgers');
-    submitForReview(restaurant, 'ADD_ITEM', {name, price, catName: catName||'General'}, `➕ NEW ITEM\n${name} - ₹${price}\nCategory: ${catName||'General'}`);
-    ctx.reply(`📤 Submitted for admin approval:\n${name} - ₹${price}\nIt will appear on the website once approved.`);
+    applyContentChangeAndNotify(restaurant, 'ADD_ITEM', {name, price, catName: catName||'General'}, `➕ NEW ITEM\n${name} - ₹${price}\nCategory: ${catName||'General'}`);
+    ctx.reply(`✅ Added and live now:\n${name} - ₹${price}`);
   });
 
   // /setprice <itemId> <newPrice> - routed through admin review, same as
@@ -1297,8 +1322,9 @@ if(TELEGRAM_BOT_TOKEN){
     const item = items[idx];
     if(!item) return ctx.reply('❌ No item with that number. Send /myitems to see the list.');
     if(!Number.isFinite(newPrice) || newPrice<=0) return ctx.reply('❌ Invalid price.');
-    submitForReview(restaurant, 'EDIT_PRICE', {itemId:item.id, newPrice}, `💰 PRICE CHANGE\n${item.name}\n₹${item.price} → ₹${newPrice}`);
-    ctx.reply(`📤 Submitted for admin approval:\n${item.name}: ₹${item.price} → ₹${newPrice}\nCurrent price stays live until approved (existing orders are never affected either way).`);
+    const oldPrice = item.price;
+    applyContentChangeAndNotify(restaurant, 'EDIT_PRICE', {itemId:item.id, newPrice}, `💰 PRICE CHANGE\n${item.name}\n₹${oldPrice} → ₹${newPrice}`);
+    ctx.reply(`✅ ${item.name}: ₹${oldPrice} → ₹${newPrice} - live now. Existing orders are never affected.`);
   });
 
   bot.command('myitems', async (ctx)=>{
@@ -1310,7 +1336,7 @@ if(TELEGRAM_BOT_TOKEN){
   });
 
   // /itemimage <item number>, then send a photo in the next message - the
-  // photo handler below picks this up. Also routed through admin review.
+  // photo handler below picks this up. Goes live instantly, admin is just notified.
   const pendingItemImage = new Map(); // telegramUserId -> {restaurantId, itemId}
   bot.command('itemimage', async (ctx)=>{
     const restaurant = findRestaurantByTelegramUser(ctx.from.id);
@@ -1320,7 +1346,7 @@ if(TELEGRAM_BOT_TOKEN){
     const item = items[idx];
     if(!item) return ctx.reply('❌ No item with that number. Send /myitems to see the list.');
     pendingItemImage.set(ctx.from.id, {restaurantId:restaurant.id, itemId:item.id, itemName:item.name});
-    ctx.reply(`📷 Now send a photo for "${item.name}". It'll be sent to admin for approval before it goes live.`);
+    ctx.reply(`📷 Now send a photo for "${item.name}". Goes live immediately.`);
   });
 
   // ---- CATEGORY MANAGEMENT ----
@@ -1453,9 +1479,10 @@ if(TELEGRAM_BOT_TOKEN){
     if(!hasHours) return ctx.reply('❌ Set hours with /sethours 10:00-22:00');
     restaurant.status='LIVE';
     restaurant.isOpen=true;
+    restaurant.isVisible=true;
     saveDB();
     logAudit('restaurant:'+restaurant.id, 'GO_LIVE', restaurant.id);
-    ctx.reply('🟢 GO LIVE SUCCESS! Your restaurant is now visible to customers.');
+    ctx.reply('🟢 GO LIVE SUCCESS! Your restaurant is now visible to customers on the website.');
 
     // Send the admin an updated data.json the moment a restaurant actually
     // goes live — this is the point the data is worth having a fresh copy
@@ -1826,8 +1853,8 @@ if(TELEGRAM_BOT_TOKEN){
       const itemImageReq = pendingItemImage.get(ctx.from.id);
       if(itemImageReq && itemImageReq.restaurantId===restaurant.id){
         pendingItemImage.delete(ctx.from.id);
-        submitForReview(restaurant, 'ITEM_IMAGE', {itemId:itemImageReq.itemId, imageUrl:fileLink.href}, `🖼 IMAGE CHANGE\n${itemImageReq.itemName}`);
-        return ctx.reply(`📤 Image submitted for admin approval on "${itemImageReq.itemName}". It'll appear on the website once approved.`);
+        applyContentChangeAndNotify(restaurant, 'ITEM_IMAGE', {itemId:itemImageReq.itemId, imageUrl:fileLink.href}, `🖼 IMAGE CHANGE\n${itemImageReq.itemName}`);
+        return ctx.reply(`✅ Image updated and live now for "${itemImageReq.itemName}".`);
       }
 
       // No pending /itemimage request -> treat any photo as a payment QR
