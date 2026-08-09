@@ -5816,8 +5816,8 @@
       "id": "83336882-cf7f-48cc-a4be-b7ac00477319",
       "restaurantId": "rest-001",
       "categoryId": "1066f610-ee6f-432e-9440-c2eb44dad828",
-      "name": "/additem Jadohsnam",
-      "description": "/additem Jadohsnam - delicious, freshly made.",
+      "name": "Jadohsnam",
+      "description": "Jadohsnam - delicious, freshly made.",
       "price": 150,
       "imageUrl": "https://api.telegram.org/file/bot8600517609:AAHByjxL106hvjjPJzKKRw52vMpvvbyvK8o/photos/file_0.jpg",
       "isVeg": false,
@@ -5829,8 +5829,8 @@
       "id": "1a03cedf-a0ae-41a8-a998-c31b1c4d4c2c",
       "restaurantId": "rest-001",
       "categoryId": "1066f610-ee6f-432e-9440-c2eb44dad828",
-      "name": "/additem Jadoh",
-      "description": "/additem Jadoh - delicious, freshly made.",
+      "name": "Jadoh",
+      "description": "Jadoh - delicious, freshly made.",
       "price": 210,
       "imageUrl": "https://picsum.photos/seed/1786258377099/400/300",
       "isVeg": false,
@@ -5886,5 +5886,9 @@
       "used": true,
       "createdAt": "2026-08-09T06:46:58.469Z"
     }
-  ]
+  ],
+  "siteSettings": {
+    "logoUrl": null,
+    "backgroundUrl": null
+  }
 }
