@@ -71,7 +71,13 @@ const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
 const GITHUB_REPO = process.env.GITHUB_REPO || ''; // "owner/repo"
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
 const GITHUB_CONTENT_PATH = process.env.GITHUB_CONTENT_PATH || 'backend/content-data.json';
-const GITHUB_CONTENT_FIELDS = ['restaurants','categories','menuItems','pendingChanges'];
+// telegramAccounts/telegramLinks are included so a restaurant owner's link
+// to their Telegram account survives a Render reset too - without this,
+// menu content restores fine after a restart but every owner gets kicked
+// back to "Not linked" / "Invalid or expired link" and needs a brand new
+// link from the Super Admin, even though nothing about their restaurant
+// actually changed.
+const GITHUB_CONTENT_FIELDS = ['restaurants','categories','menuItems','pendingChanges','telegramAccounts','telegramLinks'];
 const GITHUB_API = 'https://api.github.com';
 function githubConfigured(){ return !!(GITHUB_TOKEN && GITHUB_REPO); }
 async function githubGetContentFile(){
@@ -838,6 +844,7 @@ if(TELEGRAM_BOT_TOKEN){
       link.used=true;
       saveDB();
       logAudit('telegram:'+tgUserId, 'LINK_TELEGRAM', restaurant.id);
+      syncContentToGitHub('link_telegram:'+restaurant.code).catch(e=>console.error('backup send failed', e.message));
       return ctx.reply(`✅ RESTAURANT APPROVED\n${restaurant.name}\n\nLet's set up your restaurant.`, Markup.inlineKeyboard([
         [Markup.button.callback('🚀 START SETUP','setup_start')],
         [Markup.button.callback('❓ HELP','help')]
@@ -853,7 +860,7 @@ if(TELEGRAM_BOT_TOKEN){
   });
 
   function showSuperAdminMenu(ctx){
-    return ctx.reply(`👑 SUPER ADMIN\nWelcome to Control Center\nOrdering: ${db.systemPaused ? '⏸ PAUSED' : '🟢 ACTIVE'}\nSlots used: ${db.restaurants.filter(r=>r.status!=='DRAFT').length}/${TOTAL_RESTAURANT_SLOTS}\n\n👁 VISIBILITY: /show 001 makes restaurant 001 visible on the website, /hide 001 hides it. This is the only way a restaurant becomes visible - required even after it goes LIVE.\n\n✏️ PENDING EDITS: /pending lists menu/price/image changes submitted by restaurants that are waiting for your approval before they go live.\n\n⭐ DASHBOARD POWERS (now here too, apply instantly, no approval needed since you ARE the admin):\n/pin <code> - toggle pinned\n/highlight <code> - toggle highlighted\n/premium <code> - toggle premium\n/editinfo <code> | field=value | ... - edit name/description/deliveryFee/minOrder/commissionRate/openingHours/cuisine/city\n/logo <code> then send photo - set restaurant logo\n/cover <code> then send photo - set restaurant cover\n/items <code> - list a restaurant's items with numbers\n/edititem <code> <number> | field=value | ... - edit name/price/description/isAvailable/isVeg\n/adminitemimage <code> <number> then send photo - set item image\n\n💾 data.json is sent here automatically whenever a restaurant goes live or updates its info. Send /backup anytime for an on-demand copy. If data ever resets, reply /restore to the latest file.`, Markup.inlineKeyboard([
+    return ctx.reply(`👑 SUPER ADMIN\nWelcome to Control Center\nOrdering: ${db.systemPaused ? '⏸ PAUSED' : '🟢 ACTIVE'}\nSlots used: ${db.restaurants.filter(r=>r.status!=='DRAFT').length}/${TOTAL_RESTAURANT_SLOTS}\n\n👁 VISIBILITY: /show 001 makes restaurant 001 visible on the website, /hide 001 hides it. This is the only way a restaurant becomes visible - required even after it goes LIVE.\n\n✏️ PENDING EDITS: /pending lists menu/price/image changes submitted by restaurants that are waiting for your approval before they go live.\n\n⭐ DASHBOARD POWERS (now here too, apply instantly, no approval needed since you ARE the admin):\n/pin <code> - toggle pinned\n/highlight <code> - toggle highlighted\n/premium <code> - toggle premium\n/editinfo <code> | field=value | ... - edit name/description/deliveryFee/minOrder/commissionRate/openingHours/cuisine/city\n/logo <code> then send photo - set restaurant logo\n/cover <code> then send photo - set restaurant cover\n/items <code> - list a restaurant's items with numbers\n/edititem <code> <number> | field=value | ... - edit name/price/description/isAvailable/isVeg\n/adminitemimage <code> <number> then send photo - set item image\n/relink <code> - generate a fresh Telegram link for an already-approved restaurant (fixes a broken/lost link without re-registering)\n\n💾 data.json is sent here automatically whenever a restaurant goes live or updates its info. Send /backup anytime for an on-demand copy. If data ever resets, reply /restore to the latest file.`, Markup.inlineKeyboard([
       [Markup.button.callback('🏪 Restaurants','sa_restaurants')],
       [Markup.button.callback('📦 Orders','sa_orders'), Markup.button.callback('💳 Payments','sa_payments')],
       [Markup.button.callback('📊 Analytics','sa_analytics'), Markup.button.callback('🩺 System Health','sa_health')],
@@ -1084,6 +1091,7 @@ if(TELEGRAM_BOT_TOKEN){
         db.telegramLinks.push({token, restaurantId:appId, used:false, createdAt:new Date().toISOString()});
         saveDB();
         logAudit('superadmin:'+tgUserId, 'APPROVE_RESTAURANT', appId);
+        syncContentToGitHub('approve_restaurant:'+appId).catch(e=>console.error('backup send failed', e.message));
         await ctx.editMessageText(`✅ APPROVED ${application.restaurantName}\nLink: https://t.me/${ctx.botInfo.username}?start=link_${token}\nShare this to restaurant owner.`);
         // try to notify if we have bot to send? we don't have restaurant tg yet
         return;
@@ -1711,6 +1719,26 @@ if(TELEGRAM_BOT_TOKEN){
     ctx.reply(`📷 Now send a photo for "${item.name}". Goes live immediately.`);
   });
 
+  // /relink <code> - mint a fresh Telegram link for an ALREADY-APPROVED
+  // restaurant (e.g. after a Render reset wiped telegramAccounts/telegramLinks
+  // before the GitHub-sync fix, or if an owner just needs to re-link on a new
+  // phone/account). Re-registering through the website form always fails for
+  // these restaurants with "Application already exists" - this is the actual
+  // fix, since the restaurant/application already exists and doesn't need to
+  // be recreated, just re-linked.
+  bot.command('relink', (ctx)=>{
+    if(!isSuperAdmin(ctx.from.id)) return ctx.reply('Unauthorized');
+    const r = findRestaurantByCode(ctx.message.text.replace('/relink','').trim());
+    if(!r) return ctx.reply('Usage: /relink <code>');
+    if(!['APPROVED','LIVE'].includes(r.status)) return ctx.reply(`❌ ${r.name} is status ${r.status} - only APPROVED or LIVE restaurants can be relinked. Use /pending to approve it first if it's a fresh application.`);
+    const token = uuidv4().replace(/-/g,'').slice(0,16);
+    db.telegramLinks.push({token, restaurantId:r.id, used:false, createdAt:new Date().toISOString()});
+    saveDB();
+    logAudit('superadmin:telegram', 'RELINK_RESTAURANT', r.id);
+    syncContentToGitHub('relink:'+r.code).catch(e=>console.error('backup send failed', e.message));
+    ctx.reply(`🔗 New link for ${r.name}:\nhttps://t.me/${ctx.botInfo.username}?start=link_${token}\n\nSend this to the restaurant owner. Their old link (if any) still won't work, but this one links them straight back to their existing restaurant - no data lost.`);
+  });
+
   // Super-admin-only: change an org member's role. Exercises write:org (the
   // one GitHub admin action here that isn't read-only) — deliberately kept
   // to a single, explicit, confirmable command rather than a tap-through
@@ -2324,6 +2352,7 @@ app.post('/api/admin/applications/:id/approve', requireAdminKey, (req,res)=>{
   db.telegramLinks.push({token, restaurantId: application.id, used:false, createdAt:new Date().toISOString()});
   saveDB();
   logAudit('superadmin:webdashboard', 'APPROVE_RESTAURANT', application.id);
+  syncContentToGitHub('webdashboard:approve_restaurant:'+application.id).catch(e=>console.error('backup send failed', e.message));
   const botUsername = process.env.TELEGRAM_BOT_USERNAME || 'YourBot';
   res.json({ ok:true, application, linkUrl: `https://t.me/${botUsername}?start=link_${token}` });
 });
