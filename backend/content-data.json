@@ -17,7 +17,7 @@
       "isPinned": false,
       "isHighlighted": false,
       "isOpen": true,
-      "isBusy": true,
+      "isBusy": false,
       "deliveryFee": 30,
       "minOrder": 199,
       "deliveryTime": "30-40 min",
