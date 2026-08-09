@@ -346,13 +346,54 @@ async function openCheckout(){
     ${notice}
     <div style="padding:14px; border-radius:14px; background:#f8fafc; border:1px solid #e2e8f0;">
       <div style="font-weight:700;">Pay using UPI</div>
-      <div style="margin-top:8px; font-size:13px;">UPI ID: <b>${currentRestaurant.upiId||'restaurant@upi'}</b></div>
-      ${currentRestaurant.upiQrUrl?`<img src="${currentRestaurant.upiQrUrl}" style="width:160px;height:160px;object-fit:contain; background:#fff; border-radius:12px; margin-top:10px;"/>`:'<div style="margin-top:8px; font-size:12px; color:#64748b;">QR will be shown after restaurant uploads via Telegram</div>'}
+      <div style="margin-top:8px; font-size:13px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+        UPI ID: <b id="upiIdText">${currentRestaurant.upiId||'restaurant@upi'}</b>
+        <button type="button" onclick="copyUpiId()" style="padding:4px 10px; border-radius:999px; border:1px solid #cbd5e1; background:#fff; font-size:11px; font-weight:600; cursor:pointer;">📋 Copy</button>
+        <span id="upiCopyOk" style="font-size:11px; color:#16a34a; display:none;">Copied ✓</span>
+      </div>
+      ${currentRestaurant.upiQrUrl?`
+        <img id="upiQrImg" src="${currentRestaurant.upiQrUrl}" style="width:160px;height:160px;object-fit:contain; background:#fff; border-radius:12px; margin-top:10px; display:block;"/>
+        <button type="button" onclick="downloadUpiQr()" style="margin-top:8px; padding:8px 14px; border-radius:999px; border:1px solid #cbd5e1; background:#fff; font-size:12px; font-weight:600; cursor:pointer;">⬇️ Download QR</button>
+      `:'<div style="margin-top:8px; font-size:12px; color:#64748b;">QR will be shown after restaurant uploads via Telegram</div>'}
       <div style="margin-top:10px; font-size:13px;">Amount: <b>₹${total}</b></div>
       <div style="margin-top:6px; font-size:11px; color:#64748b;">Do not claim payment was verified merely because receipt uploaded. Restaurant verifies manually.</div>
     </div>
     <div style="margin-top:12px; font-size:13px;">Order summary: ₹${cart.reduce((s,c)=>s+c.price*c.qty,0)} + delivery ₹${currentRestaurant.deliveryFee} = <b>₹${total}</b></div>
   `;
+}
+async function copyUpiId(){
+  const text = $('#upiIdText').textContent.trim();
+  try{
+    await navigator.clipboard.writeText(text);
+  }catch(e){
+    // Clipboard API unavailable (e.g. no HTTPS) - fall back to a manual select
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position='fixed'; ta.style.opacity='0';
+    document.body.appendChild(ta); ta.select();
+    try{ document.execCommand('copy'); }catch(e2){ alert('Could not copy automatically - UPI ID: '+text); }
+    document.body.removeChild(ta);
+  }
+  const okEl = $('#upiCopyOk');
+  if(okEl){ okEl.style.display='inline'; setTimeout(()=>{ okEl.style.display='none'; }, 1500); }
+}
+async function downloadUpiQr(){
+  const url = currentRestaurant?.upiQrUrl;
+  if(!url) return;
+  try{
+    const res = await fetch(url);
+    const blob = await res.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = objectUrl;
+    a.download = `${(currentRestaurant.name||'restaurant').replace(/\s+/g,'_')}_upi_qr.jpg`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(objectUrl);
+  }catch(e){
+    // Cross-origin fetch blocked - fall back to opening it so the user can save manually
+    window.open(url, '_blank');
+  }
 }
 function closeCheckout(){ $('#checkoutModal').classList.remove('show'); }
 function showCheckoutStep(n){
