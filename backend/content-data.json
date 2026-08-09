@@ -5803,12 +5803,19 @@
   "categories": [],
   "menuItems": [],
   "pendingChanges": [],
-  "telegramAccounts": [],
+  "telegramAccounts": [
+    {
+      "telegramUserId": 7309052222,
+      "restaurantId": "rest-001",
+      "role": "OWNER",
+      "linkedAt": "2026-08-09T06:47:17.132Z"
+    }
+  ],
   "telegramLinks": [
     {
       "token": "2956a8ac084349bb",
       "restaurantId": "rest-001",
-      "used": false,
+      "used": true,
       "createdAt": "2026-08-09T06:46:58.469Z"
     }
   ]
