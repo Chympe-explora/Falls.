@@ -13,7 +13,7 @@
       "logoUrl": null,
       "coverUrl": null,
       "status": "LIVE",
-      "isVisible": false,
+      "isVisible": true,
       "isPinned": false,
       "isHighlighted": false,
       "isOpen": true,
