@@ -1294,7 +1294,14 @@ if(TELEGRAM_BOT_TOKEN){
   // text commands for restaurant
   bot.command('additem', async (ctx)=>{
     // format: /additem Chicken Burger | 250 | Burgers
-    const text = ctx.message.text.replace('/additem','').trim();
+    // Strip EVERY leading "/additem" (not just the first) - if the phone's
+    // autocomplete or a mistaken retype doubles it up (e.g. "/additem
+    // /additem Jadoh | 210 | ..."), a plain single .replace() only removes
+    // one copy and the leftover "/additem" ends up saved as part of the
+    // item's actual name/description, visible to customers on the website.
+    let text = ctx.message.text;
+    while(/^\s*\/additem\b/i.test(text)) text = text.replace(/^\s*\/additem\b/i, '');
+    text = text.trim();
     const parts = text.split('|').map(s=>s.trim());
     if(parts.length<2) return ctx.reply('Usage: /additem Name | Price | CategoryName (optional)\nExample: /additem Chicken Burger | 250 | Burgers');
     const restaurant = findRestaurantByTelegramUser(ctx.from.id);
@@ -1302,6 +1309,7 @@ if(TELEGRAM_BOT_TOKEN){
     const [name, priceStr, catName] = parts;
     const price = Number(priceStr);
     if(!name || !Number.isFinite(price) || price<=0) return ctx.reply('❌ Invalid name or price. Example: /additem Chicken Burger | 250 | Burgers');
+    if(name.startsWith('/')) return ctx.reply('❌ Item name can\'t start with "/". Looks like the command got typed twice - try again as:\n/additem '+name.replace(/^\/+\S*\s*/,'')+' | '+priceStr+(catName?' | '+catName:''));
     applyContentChangeAndNotify(restaurant, 'ADD_ITEM', {name, price, catName: catName||'General'}, `➕ NEW ITEM\n${name} - ₹${price}\nCategory: ${catName||'General'}`);
     ctx.reply(`✅ Added and live now:\n${name} - ₹${price}`);
   });
@@ -2020,11 +2028,11 @@ async function notifyRestaurantReceipt(order, localFilePath, mimetype){
   const caption = `💳 PAYMENT RECEIPT RECEIVED\n\n${formatOrderDetails(order)}`;
   const isImage = mimetype && mimetype.startsWith('image/');
   for(const acc of accounts){
+    const buttons = {reply_markup:{inline_keyboard:[
+      [{text:'✅ VERIFY', callback_data:`verify_pay_${order.code}`}, {text:'❌ REJECT', callback_data:`reject_pay_${order.code}`}],
+      [{text:'🔄 REQUEST NEW', callback_data:`request_receipt_${order.code}`}]
+    ]}};
     try{
-      const buttons = {reply_markup:{inline_keyboard:[
-        [{text:'✅ VERIFY', callback_data:`verify_pay_${order.code}`}, {text:'❌ REJECT', callback_data:`reject_pay_${order.code}`}],
-        [{text:'🔄 REQUEST NEW', callback_data:`request_receipt_${order.code}`}]
-      ]}};
       if(isImage){
         // Sends the actual receipt photo inline in the chat, with the full
         // order (customer, items, totals) as the caption underneath it.

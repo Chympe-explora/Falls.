@@ -394,13 +394,23 @@ async function placeOrder(){
     if(!res.ok) throw new Error(data.error||'Failed');
     // upload receipt if present
     const fileInput = $('#receiptFile');
+    let receiptWarning = '';
     if(fileInput.files[0]){
-      const fd = new FormData();
-      fd.append('receipt', fileInput.files[0]);
-      await fetch(`${BACKEND_URL}/api/orders/${data.code}/receipt`, {method:'POST', body: fd});
+      try{
+        const fd = new FormData();
+        fd.append('receipt', fileInput.files[0]);
+        const rres = await fetch(`${BACKEND_URL}/api/orders/${data.code}/receipt`, {method:'POST', body: fd});
+        if(!rres.ok){
+          const rdata = await rres.json().catch(()=>({}));
+          receiptWarning = rdata.error || 'Receipt upload failed - please resend it to the restaurant directly.';
+        }
+      }catch(e){
+        receiptWarning = 'Receipt upload failed (network error) - please resend it to the restaurant directly.';
+      }
     }
     currentOrderCode = data.code;
     $('#orderCodeOut').textContent = data.code;
+    if(receiptWarning) alert('⚠️ Order placed, but: '+receiptWarning);
     showCheckoutStep(3);
     cart=[]; saveCart();
     // polling for tracking not needed here
