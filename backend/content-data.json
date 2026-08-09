@@ -5809,6 +5809,13 @@
       "name": "Traditional dish",
       "emoji": "🍔",
       "sortOrder": 0
+    },
+    {
+      "id": "0d27c02f-1ee3-4da6-8c8a-5577fc490a0d",
+      "restaurantId": "rest-001",
+      "name": "soup",
+      "emoji": "🍔",
+      "sortOrder": 1
     }
   ],
   "menuItems": [
@@ -5837,6 +5844,19 @@
       "isAvailable": true,
       "prepTime": "15-20 min",
       "sortOrder": 1
+    },
+    {
+      "id": "5d8dcf17-155b-4fe1-8094-28afc93a3629",
+      "restaurantId": "rest-001",
+      "categoryId": "0d27c02f-1ee3-4da6-8c8a-5577fc490a0d",
+      "name": "Pork soup",
+      "description": "Pork soup - delicious, freshly made.",
+      "price": 350,
+      "imageUrl": "https://picsum.photos/seed/1786263025490/400/300",
+      "isVeg": false,
+      "isAvailable": true,
+      "prepTime": "15-20 min",
+      "sortOrder": 2
     }
   ],
   "pendingChanges": [
