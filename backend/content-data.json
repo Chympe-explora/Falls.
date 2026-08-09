@@ -5800,9 +5800,62 @@
       "passwordHash": null
     }
   ],
-  "categories": [],
-  "menuItems": [],
-  "pendingChanges": [],
+  "categories": [
+    {
+      "id": "1066f610-ee6f-432e-9440-c2eb44dad828",
+      "restaurantId": "rest-001",
+      "name": "Traditional dish",
+      "emoji": "🍔",
+      "sortOrder": 0
+    }
+  ],
+  "menuItems": [
+    {
+      "id": "83336882-cf7f-48cc-a4be-b7ac00477319",
+      "restaurantId": "rest-001",
+      "categoryId": "1066f610-ee6f-432e-9440-c2eb44dad828",
+      "name": "/additem Jadohsnam",
+      "description": "/additem Jadohsnam - delicious, freshly made.",
+      "price": 110,
+      "imageUrl": "https://picsum.photos/seed/1786258361848/400/300",
+      "isVeg": false,
+      "isAvailable": true,
+      "prepTime": "15-20 min",
+      "sortOrder": 0
+    }
+  ],
+  "pendingChanges": [
+    {
+      "id": "ac5428e9-bb2c-4b97-bb9a-5c4c8afdec01",
+      "restaurantId": "rest-001",
+      "code": "001",
+      "restaurantName": "Al_aman",
+      "type": "ADD_ITEM",
+      "payload": {
+        "name": "/additem Jadoh",
+        "price": 210,
+        "catName": "Traditional dish"
+      },
+      "summary": "➕ NEW ITEM\n/additem Jadoh - ₹210\nCategory: Traditional dish",
+      "status": "PENDING",
+      "createdAt": "2026-08-09T06:48:36.089Z"
+    },
+    {
+      "id": "e2964d33-6ff4-4f1c-9c60-8fa01abe9d06",
+      "restaurantId": "rest-001",
+      "code": "001",
+      "restaurantName": "Al_aman",
+      "type": "ADD_ITEM",
+      "payload": {
+        "name": "/additem Jadohsnam",
+        "price": 110,
+        "catName": "Traditional dish"
+      },
+      "summary": "➕ NEW ITEM\n/additem Jadohsnam - ₹110\nCategory: Traditional dish",
+      "status": "APPROVED",
+      "createdAt": "2026-08-09T06:49:16.827Z"
+    }
+  ],
   "telegramAccounts": [
     {
       "telegramUserId": 7309052222,
