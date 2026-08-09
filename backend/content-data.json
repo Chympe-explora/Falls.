@@ -5822,6 +5822,19 @@
       "isAvailable": true,
       "prepTime": "15-20 min",
       "sortOrder": 0
+    },
+    {
+      "id": "1a03cedf-a0ae-41a8-a998-c31b1c4d4c2c",
+      "restaurantId": "rest-001",
+      "categoryId": "1066f610-ee6f-432e-9440-c2eb44dad828",
+      "name": "/additem Jadoh",
+      "description": "/additem Jadoh - delicious, freshly made.",
+      "price": 210,
+      "imageUrl": "https://picsum.photos/seed/1786258377099/400/300",
+      "isVeg": false,
+      "isAvailable": true,
+      "prepTime": "15-20 min",
+      "sortOrder": 1
     }
   ],
   "pendingChanges": [
@@ -5837,7 +5850,7 @@
         "catName": "Traditional dish"
       },
       "summary": "➕ NEW ITEM\n/additem Jadoh - ₹210\nCategory: Traditional dish",
-      "status": "PENDING",
+      "status": "APPROVED",
       "createdAt": "2026-08-09T06:48:36.089Z"
     },
     {
