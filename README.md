@@ -61,6 +61,33 @@ npm install
 TELEGRAM_BOT_TOKEN=dummy SUPER_ADMIN_TELEGRAM_IDS=123456 node server.js
 Open frontend/index.html via live server
 
+## 🐙 GitHub admin panel (optional, Super Admin Telegram menu)
+Adds an extra "🐙 GitHub" button to the Super Admin bot menu for managing
+the org/repo this project lives in, without leaving Telegram:
+- **Org Info / Members** — org profile, plan, member list (`read:org`)
+- **Runners** — lists self-hosted Actions runners and lets you remove
+  offline ones (`manage_runners:org`)
+- **Webhooks** — lists repo webhooks; one tap creates a webhook that relays
+  `push`/`deployment_status` events from GitHub straight into every Super
+  Admin's Telegram, and lets you delete it again (`admin:repo_hook`)
+- **Projects** — lists the org's GitHub Projects (v2) boards and item
+  counts (`project`)
+- `/orgmember <username> <member|admin>` — the one write action that
+  changes something outside this repo (another person's org role), kept as
+  an explicit typed command rather than a tap-through button (`write:org`)
+
+Setup: on the **same** classic Personal Access Token used for `GITHUB_TOKEN`
+above, also grant `admin:org`, `admin:repo_hook`, and `project` scopes, then
+set:
+- `GITHUB_ORG` — your org login (auto-inferred from `GITHUB_REPO`'s
+  `owner/repo` if you don't set it separately)
+- `GITHUB_WEBHOOK_SECRET` — any random string; used to verify incoming
+  `/github/webhook` deliveries actually came from GitHub (falls back to
+  `WEBHOOK_SECRET` if unset)
+
+Nothing here is reachable without being a Super Admin - same `isSuperAdmin()`
+check as every other button in that menu.
+
 ## Staff PIN access (no new env vars needed)
 Counter staff without the owner's Telegram can manage today's orders at
 frontend/staff.html using a 6-digit PIN, scoped to today only (no menu,

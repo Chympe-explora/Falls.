@@ -133,6 +133,116 @@ async function loadContentFromGitHub(){
   }
 }
 
+// ================= GITHUB ADMIN (org / webhooks / projects) =================
+// Optional layer on top of the content-sync token above. Reuses GITHUB_TOKEN,
+// but that token now also needs (depending on which panels below you want
+// live): admin:org (or read:org/write:org), admin:repo_hook (or
+// read:repo_hook/write:repo_hook), and project (or read:project) scopes -
+// generate those on the SAME classic PAT used for GITHUB_TOKEN. Everything
+// here is reachable only from the Telegram Super Admin menu (🐙 GitHub) and
+// checks isSuperAdmin() same as every other sa_ action.
+const GITHUB_ORG = process.env.GITHUB_ORG || (GITHUB_REPO.includes('/') ? GITHUB_REPO.split('/')[0] : '');
+const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET || WEBHOOK_SECRET || '';
+function githubOrgConfigured(){ return !!(GITHUB_TOKEN && GITHUB_ORG); }
+async function ghRequest(path, opts={}){
+  const res = await fetch(`${GITHUB_API}${path}`, {
+    ...opts,
+    headers: {
+      Authorization: `token ${GITHUB_TOKEN}`,
+      Accept: 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+      ...(opts.headers||{})
+    }
+  });
+  const text = await res.text();
+  let json = null;
+  try{ json = text ? JSON.parse(text) : null; }catch(e){ /* non-JSON response */ }
+  if(!res.ok){
+    const msg = (json && (json.message || JSON.stringify(json))) || text || `HTTP ${res.status}`;
+    throw new Error(`GitHub API ${res.status}: ${msg}`);
+  }
+  return json;
+}
+// Projects (v2) live on GitHub's GraphQL endpoint, not REST - the classic
+// REST Projects API this used to use was retired by GitHub.
+async function ghGraphQL(query, variables={}){
+  const res = await fetch(`${GITHUB_API}/graphql`, {
+    method: 'POST',
+    headers: { Authorization: `bearer ${GITHUB_TOKEN}`, 'Content-Type':'application/json' },
+    body: JSON.stringify({query, variables})
+  });
+  const json = await res.json();
+  if(json.errors) throw new Error(json.errors.map(e=>e.message).join('; '));
+  return json.data;
+}
+
+async function ghOrgInfo(){
+  return ghRequest(`/orgs/${GITHUB_ORG}`);
+}
+async function ghOrgMembers(){
+  return ghRequest(`/orgs/${GITHUB_ORG}/members?per_page=30`);
+}
+async function ghSetMemberRole(username, role){ // role: 'member' | 'admin'
+  return ghRequest(`/orgs/${GITHUB_ORG}/memberships/${encodeURIComponent(username)}`, {
+    method: 'PUT',
+    body: JSON.stringify({role})
+  });
+}
+async function ghOrgRunners(){
+  return ghRequest(`/orgs/${GITHUB_ORG}/actions/runners?per_page=30`);
+}
+async function ghRemoveRunner(runnerId){
+  return ghRequest(`/orgs/${GITHUB_ORG}/actions/runners/${runnerId}`, {method:'DELETE'});
+}
+async function ghListWebhooks(){
+  return ghRequest(`/repos/${GITHUB_REPO}/hooks`);
+}
+// Creates a repo webhook pointing at this backend's /github/webhook route,
+// so pushes/deploys can be relayed straight into the Super Admin's Telegram.
+async function ghCreateDeployWebhook(){
+  return ghRequest(`/repos/${GITHUB_REPO}/hooks`, {
+    method: 'POST',
+    body: JSON.stringify({
+      name: 'web',
+      active: true,
+      events: ['push','deployment_status'],
+      config: {
+        url: `${BACKEND_URL}/github/webhook`,
+        content_type: 'json',
+        secret: GITHUB_WEBHOOK_SECRET || undefined,
+        insecure_ssl: '0'
+      }
+    })
+  });
+}
+async function ghDeleteWebhook(hookId){
+  return ghRequest(`/repos/${GITHUB_REPO}/hooks/${hookId}`, {method:'DELETE'});
+}
+async function ghOrgProjects(){
+  const data = await ghGraphQL(`
+    query($org:String!){
+      organization(login:$org){
+        projectsV2(first: 10, orderBy:{field:UPDATED_AT, direction:DESC}){
+          nodes{ id title number url closed
+            items(first:1){ totalCount }
+          }
+        }
+      }
+    }`, {org: GITHUB_ORG});
+  return data && data.organization ? data.organization.projectsV2.nodes : [];
+}
+// Verifies X-Hub-Signature-256 so only genuine GitHub deliveries are trusted.
+function verifyGithubSignature(req){
+  if(!GITHUB_WEBHOOK_SECRET) return true; // no secret configured - accept (matches how WEBHOOK_SECRET is handled elsewhere when unset)
+  const sig = req.headers['x-hub-signature-256'];
+  if(!sig) return false;
+  const crypto = require('crypto');
+  const expected = 'sha256=' + crypto.createHmac('sha256', GITHUB_WEBHOOK_SECRET).update(req.rawBody || JSON.stringify(req.body)).digest('hex');
+  try{
+    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+  }catch(e){ return false; }
+}
+
 // ================= PERSISTENCE (single source of truth) =================
 let db = {
   restaurants: [],
@@ -404,7 +514,10 @@ const app = express();
 app.use(helmet({crossOriginResourcePolicy:false}));
 app.use(cors({origin:true, credentials:true}));
 app.use(morgan('tiny'));
-app.use(express.json({limit:'10mb'}));
+// verify: captures the raw request body so the GitHub webhook handler can
+// recompute the HMAC signature - express.json() would otherwise discard it
+// after parsing, and signatures must be checked against the exact raw bytes.
+app.use(express.json({limit:'10mb', verify:(req,res,buf)=>{ req.rawBody = buf; }}));
 app.use(express.urlencoded({extended:true}));
 app.use('/uploads', express.static(UPLOAD_DIR));
 
@@ -740,11 +853,12 @@ if(TELEGRAM_BOT_TOKEN){
   });
 
   function showSuperAdminMenu(ctx){
-    return ctx.reply(`👑 SUPER ADMIN\nWelcome to Control Center\nOrdering: ${db.systemPaused ? '⏸ PAUSED' : '🟢 ACTIVE'}\nSlots used: ${db.restaurants.filter(r=>r.status!=='DRAFT').length}/${TOTAL_RESTAURANT_SLOTS}\n\n👁 VISIBILITY: /show 001 makes restaurant 001 visible on the website, /hide 001 hides it. This is the only way a restaurant becomes visible - required even after it goes LIVE.\n\n✏️ PENDING EDITS: /pending lists menu/price/image changes submitted by restaurants that are waiting for your approval before they go live.\n\n💾 data.json is sent here automatically whenever a restaurant goes live or updates its info. Send /backup anytime for an on-demand copy. If data ever resets, reply /restore to the latest file.`, Markup.inlineKeyboard([
+    return ctx.reply(`👑 SUPER ADMIN\nWelcome to Control Center\nOrdering: ${db.systemPaused ? '⏸ PAUSED' : '🟢 ACTIVE'}\nSlots used: ${db.restaurants.filter(r=>r.status!=='DRAFT').length}/${TOTAL_RESTAURANT_SLOTS}\n\n👁 VISIBILITY: /show 001 makes restaurant 001 visible on the website, /hide 001 hides it. This is the only way a restaurant becomes visible - required even after it goes LIVE.\n\n✏️ PENDING EDITS: /pending lists menu/price/image changes submitted by restaurants that are waiting for your approval before they go live.\n\n⭐ DASHBOARD POWERS (now here too, apply instantly, no approval needed since you ARE the admin):\n/pin <code> - toggle pinned\n/highlight <code> - toggle highlighted\n/premium <code> - toggle premium\n/editinfo <code> | field=value | ... - edit name/description/deliveryFee/minOrder/commissionRate/openingHours/cuisine/city\n/logo <code> then send photo - set restaurant logo\n/cover <code> then send photo - set restaurant cover\n/items <code> - list a restaurant's items with numbers\n/edititem <code> <number> | field=value | ... - edit name/price/description/isAvailable/isVeg\n/adminitemimage <code> <number> then send photo - set item image\n\n💾 data.json is sent here automatically whenever a restaurant goes live or updates its info. Send /backup anytime for an on-demand copy. If data ever resets, reply /restore to the latest file.`, Markup.inlineKeyboard([
       [Markup.button.callback('🏪 Restaurants','sa_restaurants')],
       [Markup.button.callback('📦 Orders','sa_orders'), Markup.button.callback('💳 Payments','sa_payments')],
       [Markup.button.callback('📊 Analytics','sa_analytics'), Markup.button.callback('🩺 System Health','sa_health')],
-      [Markup.button.callback('📢 Announcements','sa_announce'), Markup.button.callback('🚨 Emergency','sa_emergency')]
+      [Markup.button.callback('📢 Announcements','sa_announce'), Markup.button.callback('🚨 Emergency','sa_emergency')],
+      [Markup.button.callback('🐙 GitHub','sa_github')]
     ]));
   }
 
@@ -874,6 +988,86 @@ if(TELEGRAM_BOT_TOKEN){
         if(data==='sa_back'){
           return showSuperAdminMenu(ctx);
         }
+
+        // ---- GitHub admin (org / webhooks / projects) ----
+        if(data==='sa_github'){
+          if(!githubOrgConfigured()){
+            return ctx.reply('🐙 GitHub admin isn\'t configured yet. Set GITHUB_TOKEN (with admin:org, admin:repo_hook, project scopes) and GITHUB_ORG (or a GITHUB_REPO like "org/repo" to infer it from) in Render\'s env vars.');
+          }
+          return ctx.reply(`🐙 GITHUB ADMIN\nOrg: ${GITHUB_ORG}\nRepo: ${GITHUB_REPO || '(not set)'}`, Markup.inlineKeyboard([
+            [Markup.button.callback('🏢 Org Info','sa_gh_org'), Markup.button.callback('👥 Members','sa_gh_members')],
+            [Markup.button.callback('🖥️ Runners','sa_gh_runners'), Markup.button.callback('🔗 Webhooks','sa_gh_hooks')],
+            [Markup.button.callback('📋 Projects','sa_gh_projects')],
+            [Markup.button.callback('◀️ Back','sa_back')]
+          ]));
+        }
+        if(data==='sa_gh_org'){
+          try{
+            const org = await ghOrgInfo();
+            return ctx.reply(`🏢 ${org.login}\n${org.name || ''}\nPlan: ${org.plan ? org.plan.name : 'n/a'}\nPublic repos: ${org.public_repos}\nMembers (public count): ${org.public_members ?? 'n/a'}\n${org.html_url}`);
+          }catch(e){ return ctx.reply('❌ '+e.message); }
+        }
+        if(data==='sa_gh_members'){
+          try{
+            const members = await ghOrgMembers();
+            if(!members.length) return ctx.reply('No org members found (or token lacks read:org).');
+            return ctx.reply(`👥 ORG MEMBERS (${members.length})\n${members.slice(0,25).map(m=>'• '+m.login).join('\n')}\n\nChange a role: /orgmember <username> <member|admin>`);
+          }catch(e){ return ctx.reply('❌ '+e.message); }
+        }
+        if(data==='sa_gh_runners'){
+          try{
+            const data2 = await ghOrgRunners();
+            const runners = data2.runners || [];
+            if(!runners.length) return ctx.reply('🖥️ No self-hosted Actions runners registered for this org.');
+            return ctx.reply(`🖥️ RUNNERS (${runners.length})\n${runners.map(r=>`• ${r.name} — ${r.status}${r.busy ? ' (busy)' : ''}`).join('\n')}`, Markup.inlineKeyboard(
+              runners.filter(r=>r.status==='offline').slice(0,10).map(r=>[Markup.button.callback(`🗑️ Remove offline: ${r.name}`, 'sa_gh_rm_runner_'+r.id)])
+            ));
+          }catch(e){ return ctx.reply('❌ '+e.message); }
+        }
+        if(data.startsWith('sa_gh_rm_runner_')){
+          const runnerId = data.replace('sa_gh_rm_runner_','');
+          try{
+            await ghRemoveRunner(runnerId);
+            logAudit('superadmin:'+tgUserId, 'GITHUB_REMOVE_RUNNER', runnerId);
+            return ctx.reply('✅ Runner removed.');
+          }catch(e){ return ctx.reply('❌ '+e.message); }
+        }
+        if(data==='sa_gh_hooks'){
+          if(!GITHUB_REPO) return ctx.reply('Set GITHUB_REPO ("owner/repo") to manage webhooks.');
+          try{
+            const hooks = await ghListWebhooks();
+            const lines = hooks.length ? hooks.map(h=>`• #${h.id} ${h.config && h.config.url} (${(h.events||[]).join(',')}) ${h.active?'🟢':'🔴'}`).join('\n') : 'No webhooks yet.';
+            const buttons = hooks.filter(h=>h.config && h.config.url === `${BACKEND_URL}/github/webhook`).map(h=>[Markup.button.callback(`🗑️ Delete #${h.id}`, 'sa_gh_hook_del_'+h.id)]);
+            if(!hooks.some(h=>h.config && h.config.url === `${BACKEND_URL}/github/webhook`)){
+              buttons.push([Markup.button.callback('➕ Create deploy-notify webhook','sa_gh_hook_create')]);
+            }
+            buttons.push([Markup.button.callback('◀️ Back','sa_github')]);
+            return ctx.reply(`🔗 WEBHOOKS — ${GITHUB_REPO}\n${lines}`, Markup.inlineKeyboard(buttons));
+          }catch(e){ return ctx.reply('❌ '+e.message); }
+        }
+        if(data==='sa_gh_hook_create'){
+          try{
+            const hook = await ghCreateDeployWebhook();
+            logAudit('superadmin:'+tgUserId, 'GITHUB_CREATE_WEBHOOK', String(hook.id));
+            return ctx.reply(`✅ Webhook created (#${hook.id}) -> ${BACKEND_URL}/github/webhook\nPush + deployment_status events will now be relayed here.${GITHUB_WEBHOOK_SECRET ? '' : '\n⚠️ No GITHUB_WEBHOOK_SECRET set - anyone who finds the URL could send fake events. Set one in Render env vars and recreate the hook.'}`);
+          }catch(e){ return ctx.reply('❌ '+e.message); }
+        }
+        if(data.startsWith('sa_gh_hook_del_')){
+          const hookId = data.replace('sa_gh_hook_del_','');
+          try{
+            await ghDeleteWebhook(hookId);
+            logAudit('superadmin:'+tgUserId, 'GITHUB_DELETE_WEBHOOK', hookId);
+            return ctx.reply(`✅ Webhook #${hookId} deleted.`);
+          }catch(e){ return ctx.reply('❌ '+e.message); }
+        }
+        if(data==='sa_gh_projects'){
+          try{
+            const projects = await ghOrgProjects();
+            if(!projects.length) return ctx.reply('📋 No GitHub Projects found for this org (or token lacks the project scope).');
+            return ctx.reply(`📋 PROJECT BOARDS\n${projects.map(p=>`• #${p.number} ${p.title}${p.closed?' (closed)':''} — ${p.items.totalCount} items\n  ${p.url}`).join('\n')}`);
+          }catch(e){ return ctx.reply('❌ '+e.message); }
+        }
+
         return ctx.answerCbQuery();
       }
 
@@ -1358,7 +1552,184 @@ if(TELEGRAM_BOT_TOKEN){
       pendingBroadcastAdmins.delete(ctx.from.id);
       return ctx.reply('❌ Announcement cancelled.');
     }
+    if(pendingAdminImage.has(ctx.from.id)){
+      pendingAdminImage.delete(ctx.from.id);
+      return ctx.reply('❌ Image upload cancelled.');
+    }
     return ctx.reply('Nothing to cancel.');
+  });
+
+  // ==== SUPER ADMIN: mirror every website-admin-dashboard power in Telegram ====
+  // These apply INSTANTLY (no pendingChanges approval queue) - the person
+  // running these commands already is the Super Admin, exactly like the
+  // website dashboard buttons/uploads. Same audit trail + GitHub sync as
+  // every other content edit.
+  function findRestaurantByCode(code){
+    const padded = String(code||'').trim().padStart(3,'0');
+    return db.restaurants.find(r=>r.code===padded);
+  }
+  bot.command('pin', (ctx)=>{
+    if(!isSuperAdmin(ctx.from.id)) return ctx.reply('Unauthorized');
+    const r = findRestaurantByCode(ctx.message.text.replace('/pin','').trim());
+    if(!r) return ctx.reply('❌ No restaurant with that code.');
+    r.isPinned = !r.isPinned;
+    saveDB();
+    logAudit('superadmin:telegram', r.isPinned?'PIN':'UNPIN', r.id);
+    persistContentChange('telegram:'+(r.isPinned?'pin':'unpin')+':'+r.code).catch(e=>console.error('backup send failed', e.message));
+    ctx.reply(`${r.isPinned?'📌 Pinned':'📍 Unpinned'}: ${r.name}`);
+  });
+  bot.command('highlight', (ctx)=>{
+    if(!isSuperAdmin(ctx.from.id)) return ctx.reply('Unauthorized');
+    const r = findRestaurantByCode(ctx.message.text.replace('/highlight','').trim());
+    if(!r) return ctx.reply('❌ No restaurant with that code.');
+    r.isHighlighted = !r.isHighlighted;
+    saveDB();
+    logAudit('superadmin:telegram', r.isHighlighted?'HIGHLIGHT':'REMOVE_HIGHLIGHT', r.id);
+    persistContentChange('telegram:'+(r.isHighlighted?'highlight':'unhighlight')+':'+r.code).catch(e=>console.error('backup send failed', e.message));
+    ctx.reply(`${r.isHighlighted?'✨ Highlighted':'Highlight removed from'}: ${r.name}`);
+  });
+  bot.command('premium', (ctx)=>{
+    if(!isSuperAdmin(ctx.from.id)) return ctx.reply('Unauthorized');
+    const r = findRestaurantByCode(ctx.message.text.replace('/premium','').trim());
+    if(!r) return ctx.reply('❌ No restaurant with that code.');
+    r.premium = !r.premium;
+    saveDB();
+    logAudit('superadmin:telegram', r.premium?'MAKE_PREMIUM':'REMOVE_PREMIUM', r.id);
+    persistContentChange('telegram:'+(r.premium?'premium':'unpremium')+':'+r.code).catch(e=>console.error('backup send failed', e.message));
+    ctx.reply(`${r.premium?'👑 Marked premium':'Premium removed from'}: ${r.name}`);
+  });
+
+  // /editinfo <code> | field=value | field2=value2  (same allowed fields as
+  // the website dashboard's PATCH /api/admin/restaurants/:id)
+  bot.command('editinfo', (ctx)=>{
+    if(!isSuperAdmin(ctx.from.id)) return ctx.reply('Unauthorized');
+    const parts = ctx.message.text.replace('/editinfo','').trim().split('|').map(s=>s.trim());
+    const usage = 'Usage: /editinfo <code> | field=value | field2=value2\nFields: name, description, deliveryFee, minOrder, commissionRate, openingHours, cuisine, city\nExample: /editinfo 001 | deliveryFee=30 | minOrder=150';
+    if(parts.length<2) return ctx.reply(usage);
+    const r = findRestaurantByCode(parts[0]);
+    if(!r) return ctx.reply('❌ No restaurant with that code.');
+    const allowed = ['name','description','deliveryFee','minOrder','commissionRate','openingHours','cuisine','city'];
+    const numeric = ['deliveryFee','minOrder','commissionRate'];
+    const prev = {}; const next = {};
+    for(const pair of parts.slice(1)){
+      const eq = pair.indexOf('=');
+      if(eq<0) continue;
+      const key = pair.slice(0,eq).trim();
+      const val = pair.slice(eq+1).trim();
+      if(!allowed.includes(key) || val==='') continue;
+      prev[key] = r[key];
+      r[key] = numeric.includes(key) ? Number(val) : val;
+      next[key] = r[key];
+    }
+    if(Object.keys(next).length===0) return ctx.reply('❌ No valid fields recognized.\n'+usage);
+    saveDB();
+    logAudit('superadmin:telegram', 'UPDATE_RESTAURANT', r.id, prev, next);
+    persistContentChange('telegram:update_restaurant:'+r.code).catch(e=>console.error('backup send failed', e.message));
+    ctx.reply(`✅ Updated ${r.name}:\n`+Object.entries(next).map(([k,v])=>`${k}: ${v}`).join('\n'));
+  });
+
+  // /logo <code> or /cover <code>, then send a photo in the next message -
+  // the photo handler below picks this up via pendingAdminImage. Applies
+  // instantly, unlike a restaurant owner's own photo uploads.
+  const pendingAdminImage = new Map(); // telegramUserId -> {type:'logo'|'cover'|'item', restaurantId, restaurantCode, itemId?, itemName?}
+  bot.command('logo', (ctx)=>{
+    if(!isSuperAdmin(ctx.from.id)) return ctx.reply('Unauthorized');
+    const r = findRestaurantByCode(ctx.message.text.replace('/logo','').trim());
+    if(!r) return ctx.reply('❌ No restaurant with that code. Usage: /logo <code>, then send a photo.');
+    pendingAdminImage.set(ctx.from.id, {type:'logo', restaurantId:r.id, restaurantCode:r.code});
+    ctx.reply(`📷 Now send the logo photo for ${r.name}. Goes live immediately.`);
+  });
+  bot.command('cover', (ctx)=>{
+    if(!isSuperAdmin(ctx.from.id)) return ctx.reply('Unauthorized');
+    const r = findRestaurantByCode(ctx.message.text.replace('/cover','').trim());
+    if(!r) return ctx.reply('❌ No restaurant with that code. Usage: /cover <code>, then send a photo.');
+    pendingAdminImage.set(ctx.from.id, {type:'cover', restaurantId:r.id, restaurantCode:r.code});
+    ctx.reply(`📷 Now send the cover photo for ${r.name}. Goes live immediately.`);
+  });
+
+  // Super-admin-wide item list (any restaurant, unlike /myitems which is
+  // scoped to the owner sending it) - gives the item numbers /edititem and
+  // /adminitemimage need.
+  bot.command('items', (ctx)=>{
+    if(!isSuperAdmin(ctx.from.id)) return ctx.reply('Unauthorized');
+    const r = findRestaurantByCode(ctx.message.text.replace('/items','').trim());
+    if(!r) return ctx.reply('Usage: /items <code>');
+    const items = db.menuItems.filter(i=>i.restaurantId===r.id);
+    if(items.length===0) return ctx.reply('No items yet for '+r.name);
+    ctx.reply(`${r.name} items:\n`+items.map((i,idx)=>`${idx+1}. ${i.name} - ₹${i.price} ${i.isAvailable?'✅':'❌'}`).join('\n')+`\n\nUse /edititem ${r.code} <number> | field=value or /adminitemimage ${r.code} <number> (then photo) - applies instantly, no approval needed.`);
+  });
+
+  // /edititem <code> <number> | field=value | field2=value2 (same allowed
+  // fields as the website dashboard's PATCH /api/admin/menu-items/:id)
+  bot.command('edititem', (ctx)=>{
+    if(!isSuperAdmin(ctx.from.id)) return ctx.reply('Unauthorized');
+    const raw = ctx.message.text.replace('/edititem','').trim();
+    const parts = raw.split('|').map(s=>s.trim());
+    const head = (parts[0]||'').split(/\s+/);
+    const usage = 'Usage: /edititem <code> <item number> | field=value | field2=value2\nFields: name, price, description, isAvailable, isVeg\nSend /items <code> to see numbers.';
+    const r = findRestaurantByCode(head[0]);
+    const idx = Number(head[1]) - 1;
+    if(!r) return ctx.reply(usage);
+    const items = db.menuItems.filter(i=>i.restaurantId===r.id);
+    const item = items[idx];
+    if(!item) return ctx.reply('❌ No item with that number. Send /items '+r.code+' to see the list.');
+    const allowed = ['name','price','description','isAvailable','isVeg'];
+    const prev = {}; const next = {};
+    for(const pair of parts.slice(1)){
+      const eq = pair.indexOf('=');
+      if(eq<0) continue;
+      const key = pair.slice(0,eq).trim();
+      const val = pair.slice(eq+1).trim();
+      if(!allowed.includes(key) || val==='') continue;
+      prev[key] = item[key];
+      if(key==='price') item[key] = Number(val);
+      else if(key==='isAvailable' || key==='isVeg') item[key] = ['true','1','yes'].includes(val.toLowerCase());
+      else item[key] = val;
+      next[key] = item[key];
+    }
+    if(Object.keys(next).length===0) return ctx.reply('❌ No valid fields recognized.\n'+usage);
+    saveDB();
+    logAudit('superadmin:telegram', 'UPDATE_MENU_ITEM', item.id, prev, next);
+    persistContentChange('telegram:update_item:'+r.code).catch(e=>console.error('backup send failed', e.message));
+    ctx.reply(`✅ Updated ${item.name}:\n`+Object.entries(next).map(([k,v])=>`${k}: ${v}`).join('\n'));
+  });
+
+  // /adminitemimage <code> <number>, then send a photo - applies instantly
+  // (unlike /itemimage, which is the restaurant owner's version and goes
+  // through admin approval).
+  bot.command('adminitemimage', (ctx)=>{
+    if(!isSuperAdmin(ctx.from.id)) return ctx.reply('Unauthorized');
+    const [code, numStr] = ctx.message.text.replace('/adminitemimage','').trim().split(/\s+/);
+    const r = findRestaurantByCode(code);
+    const idx = Number(numStr) - 1;
+    const usage = 'Usage: /adminitemimage <code> <item number>\nSend /items <code> to see numbers.';
+    if(!r) return ctx.reply(usage);
+    const items = db.menuItems.filter(i=>i.restaurantId===r.id);
+    const item = items[idx];
+    if(!item) return ctx.reply('❌ No item with that number. Send /items '+r.code+' to see the list.');
+    pendingAdminImage.set(ctx.from.id, {type:'item', restaurantId:r.id, restaurantCode:r.code, itemId:item.id, itemName:item.name});
+    ctx.reply(`📷 Now send a photo for "${item.name}". Goes live immediately.`);
+  });
+
+  // Super-admin-only: change an org member's role. Exercises write:org (the
+  // one GitHub admin action here that isn't read-only) — deliberately kept
+  // to a single, explicit, confirmable command rather than a tap-through
+  // button, since it changes another person's org access.
+  bot.command('orgmember', async (ctx)=>{
+    if(!isSuperAdmin(ctx.from.id)) return; // silently ignore, same as other sa-only commands
+    if(!githubOrgConfigured()) return ctx.reply('GitHub org admin isn\'t configured (need GITHUB_TOKEN + GITHUB_ORG).');
+    const parts = ctx.message.text.replace('/orgmember','').trim().split(/\s+/).filter(Boolean);
+    const [username, role] = parts;
+    if(!username || !['member','admin'].includes(role)){
+      return ctx.reply('Usage: /orgmember <github-username> <member|admin>');
+    }
+    try{
+      const result = await ghSetMemberRole(username, role);
+      logAudit('superadmin:'+ctx.from.id, 'GITHUB_SET_ORG_ROLE', username, null, {role});
+      ctx.reply(`✅ ${username} is now org role "${result.role}" (state: ${result.state}).`);
+    }catch(e){
+      ctx.reply('❌ '+e.message);
+    }
   });
 
   // Any plain text from a super admin who just tapped "📢 Announcements" is
@@ -1385,6 +1756,39 @@ if(TELEGRAM_BOT_TOKEN){
   });
 
   bot.on('photo', async (ctx)=>{
+    // Super Admin direct uploads (logo/cover/item image via /logo, /cover,
+    // /adminitemimage) - checked first since the admin isn't necessarily a
+    // linked restaurant Telegram account. Applies instantly, no approval.
+    if(isSuperAdmin(ctx.from.id) && pendingAdminImage.has(ctx.from.id)){
+      const req = pendingAdminImage.get(ctx.from.id);
+      pendingAdminImage.delete(ctx.from.id);
+      try{
+        const fileId = ctx.message.photo[ctx.message.photo.length-1].file_id;
+        const fileLink = await ctx.telegram.getFileLink(fileId);
+        if(req.type==='logo' || req.type==='cover'){
+          const r = db.restaurants.find(x=>x.id===req.restaurantId);
+          if(!r) return ctx.reply('❌ Restaurant no longer exists.');
+          if(req.type==='logo') r.logoUrl = fileLink.href; else r.coverUrl = fileLink.href;
+          saveDB();
+          logAudit('superadmin:telegram', req.type==='logo'?'UPDATE_LOGO':'UPDATE_COVER', r.id);
+          persistContentChange('telegram:update_'+req.type+':'+r.code).catch(e=>console.error('backup send failed', e.message));
+          return ctx.reply(`✅ ${req.type==='logo'?'Logo':'Cover'} updated for ${r.name}`, {reply_markup:{inline_keyboard:[[{text:'👀 PREVIEW', url:fileLink.href}]]}});
+        }
+        if(req.type==='item'){
+          const item = db.menuItems.find(i=>i.id===req.itemId);
+          if(!item) return ctx.reply('❌ Item no longer exists.');
+          item.imageUrl = fileLink.href;
+          saveDB();
+          logAudit('superadmin:telegram', 'UPDATE_ITEM_IMAGE', item.id);
+          persistContentChange('telegram:update_item_image:'+req.restaurantCode).catch(e=>console.error('backup send failed', e.message));
+          return ctx.reply(`✅ Image updated for ${item.name}`, {reply_markup:{inline_keyboard:[[{text:'👀 PREVIEW', url:fileLink.href}]]}});
+        }
+      }catch(e){
+        return ctx.reply('Failed to process photo: '+e.message);
+      }
+      return;
+    }
+
     const restaurant = findRestaurantByTelegramUser(ctx.from.id);
     if(!restaurant) return;
     try{
@@ -1422,6 +1826,34 @@ if(TELEGRAM_BOT_TOKEN){
     }
     bot.handleUpdate(req.body);
     res.sendStatus(200);
+  });
+
+  // Receiving end for the repo webhook created from 🐙 GitHub -> Webhooks ->
+  // Create deploy webhook. Relays push/deploy events straight to every
+  // Super Admin's Telegram. Requires GITHUB_WEBHOOK_SECRET to match what the
+  // hook was created with (see ghCreateDeployWebhook above).
+  app.post('/github/webhook', (req,res)=>{
+    if(!verifyGithubSignature(req)) return res.sendStatus(401);
+    const event = req.headers['x-github-event'] || 'unknown';
+    const payload = req.body || {};
+    res.sendStatus(200); // ack immediately, GitHub retries on slow/failed responses
+    if(SUPER_ADMIN_IDS.length===0) return;
+    let text = null;
+    if(event === 'push'){
+      const branch = (payload.ref||'').replace('refs/heads/','');
+      const commits = Array.isArray(payload.commits) ? payload.commits : [];
+      text = `🐙 PUSH to ${GITHUB_REPO} (${branch})\n${payload.pusher ? 'by '+payload.pusher.name : ''}\n${commits.slice(0,5).map(c=>'• '+(c.message||'').split('\n')[0]).join('\n') || 'No commits listed'}`;
+    } else if(event === 'deployment_status'){
+      const s = payload.deployment_status || {};
+      text = `🚀 DEPLOYMENT ${s.state || 'update'} for ${GITHUB_REPO}\n${s.description || ''}`;
+    } else if(event === 'ping'){
+      text = `🐙 Webhook connected for ${GITHUB_REPO} ✅`;
+    }
+    if(text){
+      for(const adminId of SUPER_ADMIN_IDS){
+        bot.telegram.sendMessage(adminId, text).catch(e=>console.error('github webhook notify failed', e.message));
+      }
+    }
   });
 
   // Launch bot in polling mode if not webhook
