@@ -250,6 +250,44 @@ function addToCart(itemId){
   if(currentRestaurant) openRestaurant(currentRestaurant.id); // cheap re-render for demo - ideally patch
   else renderCart();
 }
+// Prices in the cart are only ever a display cache (the server always
+// re-reads the true price at checkout - see POST /api/orders), but a stale
+// display is still a real problem: a customer could be shown - and pay via
+// UPI - an amount that no longer matches what the restaurant actually
+// charges once their order lands. This re-fetches the restaurant's live
+// menu and updates every cart line to match before anything price-sensitive
+// is shown (opening the cart, opening checkout, right before placing the
+// order). Items a restaurant removed or marked unavailable are dropped from
+// the cart automatically, with a heads-up to the customer either way.
+let priceChangeNotice = '';
+async function refreshCartPrices(){
+  if(!cart.length) return;
+  const restaurantId = cart[0].restaurantId;
+  try{
+    const res = await fetch(`${BACKEND_URL}/api/restaurants/${restaurantId}`);
+    if(!res.ok) return; // offline/unreachable - keep showing last known cart rather than blocking the user
+    const fresh = await res.json();
+    const freshItems = fresh.items || [];
+    const changed = [];
+    const removed = [];
+    cart = cart.filter(c=>{
+      const liveItem = freshItems.find(i=>i.id===c.id);
+      if(!liveItem || !liveItem.isAvailable){ removed.push(c.name); return false; }
+      if(liveItem.price !== c.price){ changed.push(`${c.name}: ₹${c.price} → ₹${liveItem.price}`); c.price = liveItem.price; }
+      if(liveItem.name !== c.name) c.name = liveItem.name;
+      return true;
+    });
+    if(changed.length || removed.length){
+      saveCart();
+      const parts = [];
+      if(changed.length) parts.push('Price updated - ' + changed.join(', '));
+      if(removed.length) parts.push('No longer available, removed from cart: ' + removed.join(', '));
+      priceChangeNotice = parts.join(' • ');
+    } else {
+      priceChangeNotice = '';
+    }
+  }catch(e){ /* stay on last known cart if the network call fails */ }
+}
 function saveCart(){
   localStorage.setItem('cart', JSON.stringify(cart));
   renderCartBar();
@@ -262,7 +300,8 @@ function renderCartBar(){
   $('#cartItemsPreview').textContent = cart.slice(0,2).map(c=>c.name).join(', ') + (cart.length>2?' + more':'');
   $('#cartBar').classList.toggle('show', count>0);
   $('#cartModalTotal').textContent = total + (currentRestaurant?currentRestaurant.deliveryFee:0);
-  $('#cartList').innerHTML = cart.map(c=>`
+  const notice = priceChangeNotice ? `<div style="padding:10px; border-radius:12px; background:#fff7ed; border:1px solid #fdba74; font-size:12px; color:#9a3412; margin-bottom:10px;">⚠️ ${priceChangeNotice}</div>` : '';
+  $('#cartList').innerHTML = notice + cart.map(c=>`
     <div style="display:flex; justify-content:space-between; align-items:center; padding:10px; border-radius:12px; background:#f8fafc;">
       <div><div style="font-weight:600;">${c.name}</div><div style="font-size:12px; color:#64748b;">₹${c.price} × ${c.qty}</div></div>
       <div style="display:flex; gap:8px; align-items:center;">
@@ -282,20 +321,29 @@ function changeQty(id, delta){
   renderCartBar();
   if(currentRestaurant) {} // keep page
 }
-function openCart(){ $('#cartModal').classList.add('show'); renderCartBar(); }
+async function openCart(){
+  $('#cartModal').classList.add('show');
+  renderCartBar(); // show cached values instantly, no flash of empty state
+  await refreshCartPrices();
+  renderCartBar(); // then reconcile with live prices
+}
 function closeCart(){ $('#cartModal').classList.remove('show'); }
 
 // CHECKOUT
-function openCheckout(){
+async function openCheckout(){
   if(!currentRestaurant) return;
   if(!cart.length) return alert('Cart empty');
+  await refreshCartPrices(); // last live sync before anything payment-related is shown
+  if(!cart.length) return alert('Everything in your cart is no longer available. Please add items again.');
   $('#checkoutRestaurantName').textContent = currentRestaurant.name;
   $('#checkoutModal').classList.add('show');
   showCheckoutStep(1);
   closeCart();
   // payment box
   const total = cart.reduce((s,c)=>s+c.price*c.qty,0) + currentRestaurant.deliveryFee;
+  const notice = priceChangeNotice ? `<div style="padding:10px; border-radius:12px; background:#fff7ed; border:1px solid #fdba74; font-size:12px; color:#9a3412; margin-bottom:10px;">⚠️ ${priceChangeNotice}</div>` : '';
   $('#paymentBox').innerHTML = `
+    ${notice}
     <div style="padding:14px; border-radius:14px; background:#f8fafc; border:1px solid #e2e8f0;">
       <div style="font-weight:700;">Pay using UPI</div>
       <div style="margin-top:8px; font-size:13px;">UPI ID: <b>${currentRestaurant.upiId||'restaurant@upi'}</b></div>
@@ -322,6 +370,8 @@ function goToPayment(){
   showCheckoutStep(2);
 }
 async function placeOrder(){
+  await refreshCartPrices();
+  if(!cart.length){ alert('Everything in your cart is no longer available.'); closeCheckout(); return; }
   const idempotencyKey = 'order_'+Date.now()+'_'+Math.random().toString(36).slice(2);
   const payload = {
     restaurantId: currentRestaurant.id,

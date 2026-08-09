@@ -11,34 +11,6 @@ const { v4: uuidv4 } = require('uuid');
 const fs = require('fs');
 const path = require('path');
 const multer = require('multer');
-const { Agent: UndiciAgent, setGlobalDispatcher } = require('undici');
-
-// Render's outbound network occasionally resolves api.telegram.org over a
-// path that drops the connection mid-upload ("socket hang up"), especially
-// on sendDocument/sendPhoto calls with a file attached. Telegraf (from
-// v4.12+) makes its HTTP calls with Node's built-in `fetch`, which is
-// powered by undici - NOT the classic `https` module. A plain
-// `https.Agent` passed via Telegraf's `{telegram:{agent}}` option is
-// therefore silently ignored by native fetch; it never touches the actual
-// request. Forcing IPv4 + keep-alive has to happen at the undici dispatcher
-// level instead, applied globally, so it actually affects every fetch()
-// call in the process, Telegraf's included.
-setGlobalDispatcher(new UndiciAgent({
-  connect: { family: 4 },   // avoid the flaky IPv6 route that causes the hang ups
-  keepAliveTimeout: 15000,
-  keepAliveMaxTimeout: 15000,
-  headersTimeout: 20000,
-  bodyTimeout: 20000
-}));
-
-// Safety net: if a promise rejection is ever left uncaught anywhere (e.g. a
-// Telegram call that times out deep inside a library), modern Node kills
-// the whole process instead of just logging it - which is what was causing
-// the server to restart mid-backup. Log it and keep the server alive
-// instead of crashing and losing whatever else was in flight.
-process.on('unhandledRejection', (err) => {
-  console.error('Unhandled rejection (server kept running):', err && err.message || err);
-});
 
 // ================= CONFIG =================
 const PORT = process.env.PORT || 10000;
@@ -51,9 +23,115 @@ const WHATSAPP_NUMBER = process.env.WHATSAPP_SUPPORT_NUMBER || '919999999999';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || '';
 
-const DATA_FILE = path.join(__dirname, 'data.json');
-const UPLOAD_DIR = path.join(__dirname, 'uploads');
+// DATA_DIR controls where data.json and /uploads actually live on disk.
+// Render's FREE plan gives every deploy a brand-new, empty filesystem - so
+// by default (DATA_DIR unset) everything here is wiped on every restart,
+// and the Telegram auto-backup + /restore flow below is the ONLY thing
+// standing between you and losing all restaurant data.
+// To make it genuinely restart-proof with no manual /restore step:
+//   1. Upgrade the Render service off the Free plan (a persistent Disk is
+//      not available on Free - see backend/render.yaml, which has a disk
+//      block ready to enable once you're on a paid plan).
+//   2. Set DATA_DIR in Render's env vars to the disk's mount path
+//      (render.yaml mounts it at /var/data).
+// With that done, every write below (saveDB + every image upload) lands on
+// the persistent disk directly - a restart or redeploy no longer touches
+// it at all. The Telegram backup keeps running either way as a second
+// safety net (e.g. accidental data.json edits), it just stops being the
+// only thing keeping you safe.
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, {recursive:true});
+const DATA_FILE = path.join(DATA_DIR, 'data.json');
+const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, {recursive:true});
+console.log(process.env.DATA_DIR
+  ? `💾 Persistent disk in use (DATA_DIR=${DATA_DIR}) - data survives restarts automatically.`
+  : `⚠️  No DATA_DIR set - data.json and /uploads live on Render's ephemeral disk and WILL be wiped on restart/redeploy. Relying on the Telegram auto-backup + /restore for persistence. See the DATA_DIR comment above to make this permanent.`);
+
+// ---- GITHUB-BACKED CONTENT PERSISTENCE (survives resets with NO paid plan) ----
+// This is the real fix for "the website's restaurant data must survive a
+// Render reset": restaurants/categories/menu items/pending changes get
+// committed straight to your GitHub repo as a data file, in addition to
+// the local data.json write. Render always redeploys by re-cloning your
+// repo from scratch - so unlike anything written to local disk (which is
+// wiped every restart on the Free plan), a git commit is permanent. It's
+// genuinely part of "the code" now, exactly as asked for.
+// On boot, this repo file is read FIRST (source of truth for content), and
+// only falls back to the local file / blank 200-slot seed if GitHub isn't
+// configured or the repo file doesn't exist yet.
+// Orders/receipts/audit logs deliberately stay OUT of git (local disk +
+// existing Telegram backup only) - those change on every single order, and
+// committing that volume to git would spam your repo history and quickly
+// burn through GitHub's API rate limit. Menu/restaurant content changes far
+// less often, so it's a good fit for "the code" model.
+// Setup: create a GitHub Personal Access Token with "repo" scope, then set
+// GITHUB_TOKEN and GITHUB_REPO=("yourname/yourrepo") in Render's env vars.
+// Nothing else to do - it activates automatically once both are set.
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+const GITHUB_REPO = process.env.GITHUB_REPO || ''; // "owner/repo"
+const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
+const GITHUB_CONTENT_PATH = process.env.GITHUB_CONTENT_PATH || 'backend/content-data.json';
+const GITHUB_CONTENT_FIELDS = ['restaurants','categories','menuItems','pendingChanges'];
+const GITHUB_API = 'https://api.github.com';
+function githubConfigured(){ return !!(GITHUB_TOKEN && GITHUB_REPO); }
+async function githubGetContentFile(){
+  const res = await fetch(`${GITHUB_API}/repos/${GITHUB_REPO}/contents/${encodeURIComponent(GITHUB_CONTENT_PATH)}?ref=${GITHUB_BRANCH}`, {
+    headers: { Authorization: `token ${GITHUB_TOKEN}`, Accept:'application/vnd.github+json' }
+  });
+  if(res.status===404) return {content:null, sha:null};
+  if(!res.ok) throw new Error(`GitHub GET ${res.status}: ${await res.text().catch(()=> '')}`);
+  const data = await res.json();
+  return {content: JSON.parse(Buffer.from(data.content,'base64').toString('utf8')), sha: data.sha};
+}
+async function githubPutContentFile(contentObj, sha, message){
+  const body = {
+    message,
+    content: Buffer.from(JSON.stringify(contentObj,null,2)).toString('base64'),
+    branch: GITHUB_BRANCH
+  };
+  if(sha) body.sha = sha;
+  const res = await fetch(`${GITHUB_API}/repos/${GITHUB_REPO}/contents/${encodeURIComponent(GITHUB_CONTENT_PATH)}`, {
+    method:'PUT',
+    headers: { Authorization: `token ${GITHUB_TOKEN}`, Accept:'application/vnd.github+json', 'Content-Type':'application/json' },
+    body: JSON.stringify(body)
+  });
+  if(!res.ok) throw new Error(`GitHub PUT ${res.status}: ${await res.text().catch(()=> '')}`);
+  return res.json();
+}
+// Simple in-process queue so two near-simultaneous edits (e.g. approving two
+// pending changes back to back) don't race on the file's SHA and clobber
+// each other - each commit waits for the previous one to finish first.
+let githubSyncQueue = Promise.resolve();
+function syncContentToGitHub(message){
+  if(!githubConfigured()) return Promise.resolve();
+  githubSyncQueue = githubSyncQueue.then(async ()=>{
+    try{
+      const {sha} = await githubGetContentFile();
+      const contentObj = {};
+      for(const f of GITHUB_CONTENT_FIELDS) contentObj[f] = db[f];
+      await githubPutContentFile(contentObj, sha, `content update: ${message}`);
+      console.log('✅ GitHub content commit OK:', message);
+    }catch(e){
+      console.error('❌ GitHub content commit FAILED:', e.message);
+    }
+  });
+  return githubSyncQueue;
+}
+async function loadContentFromGitHub(){
+  if(!githubConfigured()) return false;
+  try{
+    const {content} = await githubGetContentFile();
+    if(!content) return false; // file doesn't exist in the repo yet - first-ever boot, nothing to restore
+    for(const f of GITHUB_CONTENT_FIELDS){
+      if(content[f] !== undefined) db[f] = content[f];
+    }
+    console.log(`💾 Content restored from GitHub (${GITHUB_REPO}) - restaurants/menu survive resets automatically.`);
+    return true;
+  }catch(e){
+    console.error('loadContentFromGitHub failed:', e.message);
+    return false;
+  }
+}
 
 // ================= PERSISTENCE (single source of truth) =================
 let db = {
@@ -66,12 +144,14 @@ let db = {
   telegramLinks: [], // {token, restaurantId, used}
   telegramAccounts: [], // {telegramUserId, restaurantId, role}
   staff: [],
+  pendingChanges: [], // items/prices/images submitted by a restaurant, awaiting Super Admin approval before going live
   auditLogs: [],
   idempotency: {}, // key -> orderCode
   receipts: [],
   systemPaused: false // platform-wide emergency pause, toggled from the Super Admin bot
 };
 
+let dbFileExistedAtBoot = true;
 function loadDB(){
   try{
     if(fs.existsSync(DATA_FILE)){
@@ -79,6 +159,8 @@ function loadDB(){
       const parsed = JSON.parse(raw);
       db = {...db, ...parsed};
       console.log('DB loaded');
+    } else {
+      dbFileExistedAtBoot = false;
     }
   }catch(e){ console.error('DB load error', e); }
 }
@@ -86,99 +168,97 @@ function saveDB(){
   try{ fs.writeFileSync(DATA_FILE, JSON.stringify(db,null,2)); }catch(e){ console.error('save error', e); }
 }
 loadDB();
+// If data.json didn't exist at boot (typical after a Render Free restart)
+// AND there's no persistent DATA_DIR, the 200 slots would normally get
+// reseeded blank below - UNLESS GitHub content persistence is configured
+// and successfully restores real data first (see bootstrapContent below,
+// which finalizes this flag after attempting that restore).
+let dbLikelyWiped = !dbFileExistedAtBoot && !process.env.DATA_DIR;
 
 if(TELEGRAM_BOT_TOKEN && process.env.NODE_ENV === 'production' && !WEBHOOK_SECRET){
   console.warn('⚠️  WEBHOOK_SECRET is not set. /telegram/webhook will reject ALL requests (including real ones from Telegram) until you set it in Render env vars.');
 }
 
 // seed if empty
-if(db.restaurants.length===0){
-  const sampleRestaurants = [
-    {id:"rest-waterfall-grill",   name:"Waterfall Grill",       cuisine:"North Indian, BBQ",   rating:4.6, deliveryTime:"25-30 min", deliveryFee:30, minOrder:199, city:"Bhopal", address:"MP Nagar",          isVeg:false},
-    {id:"rest-mist-spice",        name:"Mist & Spice",          cuisine:"South Indian",        rating:4.5, deliveryTime:"20-25 min", deliveryFee:25, minOrder:149, city:"Bhopal", address:"Arera Colony",      isVeg:true},
-    {id:"rest-cloud-noodles",     name:"Cloud Noodles",         cuisine:"Chinese, Thai",       rating:4.3, deliveryTime:"30-35 min", deliveryFee:35, minOrder:199, city:"Bhopal", address:"Kolar",             isVeg:false},
-    {id:"rest-burger-falls",      name:"Burger Falls",          cuisine:"Burgers, American",   rating:4.4, deliveryTime:"20-30 min", deliveryFee:20, minOrder:149, city:"Bhopal", address:"New Market",        isVeg:false},
-    {id:"rest-pizza-cascade",     name:"Pizza Cascade",         cuisine:"Italian, Pizza",      rating:4.7, deliveryTime:"25-35 min", deliveryFee:30, minOrder:299, city:"Bhopal", address:"Habibganj",         isVeg:false},
-    {id:"rest-tandoor-drift",     name:"Tandoor Drift",         cuisine:"Mughlai, Kebab",      rating:4.2, deliveryTime:"30-40 min", deliveryFee:40, minOrder:249, city:"Bhopal", address:"Bittan Market",     isVeg:false},
-    {id:"rest-green-valley-bowls",name:"Green Valley Bowls",    cuisine:"Healthy, Salads",     rating:4.5, deliveryTime:"15-20 min", deliveryFee:15, minOrder:199, city:"Bhopal", address:"Shahpura",          isVeg:true},
-    {id:"rest-sweet-stream",      name:"Sweet Stream",          cuisine:"Desserts, Bakery",    rating:4.6, deliveryTime:"15-25 min", deliveryFee:20, minOrder:99,  city:"Bhopal", address:"10 No Stop",        isVeg:true},
-    {id:"rest-chai-falls",        name:"Chai & Falls",          cuisine:"Snacks, Tea",         rating:4.3, deliveryTime:"15-20 min", deliveryFee:10, minOrder:99,  city:"Bhopal", address:"MP Nagar Zone 2",   isVeg:true},
-    {id:"rest-wok-water",         name:"Wok & Water",           cuisine:"Asian, Noodles",      rating:4.1, deliveryTime:"25-30 min", deliveryFee:30, minOrder:199, city:"Bhopal", address:"Indrapuri",         isVeg:false},
-    {id:"rest-curry-rapids",      name:"Curry Rapids",          cuisine:"Indian, Curry",       rating:4.4, deliveryTime:"30-35 min", deliveryFee:35, minOrder:199, city:"Bhopal", address:"Hoshangabad Road",  isVeg:false},
-    {id:"rest-fry-falls",         name:"Fry Falls",             cuisine:"Snacks, Fries",       rating:4.0, deliveryTime:"15-20 min", deliveryFee:15, minOrder:99,  city:"Bhopal", address:"Ayodhya Nagar",     isVeg:true},
-    {id:"rest-grill-by-the-falls",name:"Grill By The Falls",    cuisine:"BBQ, Continental",    rating:4.8, deliveryTime:"35-45 min", deliveryFee:50, minOrder:399, city:"Bhopal", address:"Bawadiya Kalan",    isVeg:false},
-    {id:"rest-dosa-mist",         name:"Dosa Mist",             cuisine:"South Indian",        rating:4.5, deliveryTime:"20-25 min", deliveryFee:20, minOrder:149, city:"Bhopal", address:"Lalghati",          isVeg:true},
-    {id:"rest-rolling-river",     name:"Rolling River",         cuisine:"Wraps, Rolls",        rating:4.2, deliveryTime:"20-25 min", deliveryFee:25, minOrder:149, city:"Bhopal", address:"Piplani",           isVeg:false},
-    {id:"rest-momo-springs",      name:"Momo Springs",          cuisine:"Tibetan, Momos",      rating:4.3, deliveryTime:"20-30 min", deliveryFee:20, minOrder:149, city:"Bhopal", address:"Karond",            isVeg:false},
-    {id:"rest-biriyani-bay",      name:"Biriyani Bay",          cuisine:"Biryani, Hyderabadi", rating:4.6, deliveryTime:"30-40 min", deliveryFee:40, minOrder:299, city:"Bhopal", address:"BHEL",              isVeg:false},
-    {id:"rest-juice-junction",    name:"Juice Junction Falls",  cuisine:"Juices, Drinks",      rating:4.1, deliveryTime:"10-15 min", deliveryFee:10, minOrder:99,  city:"Bhopal", address:"MP Nagar",          isVeg:true},
-    {id:"rest-kebab-cascade",     name:"Kebab Cascade",         cuisine:"Kebabs, Mughlai",     rating:4.7, deliveryTime:"30-35 min", deliveryFee:35, minOrder:299, city:"Bhopal", address:"Old City",          isVeg:false},
-    {id:"rest-pasta-falls",       name:"Pasta Falls",           cuisine:"Italian, Pasta",      rating:4.4, deliveryTime:"25-30 min", deliveryFee:30, minOrder:249, city:"Bhopal", address:"Arera Hills",       isVeg:true},
-  ];
-  sampleRestaurants.forEach((r,i)=>{
-    const id = r.id; // fixed, stable id - do NOT switch this back to uuidv4().
-    // Seed data re-runs every time db.restaurants is empty (e.g. after a
-    // restart with no persistent disk on Render free tier). A random id
-    // here would change on every reseed, silently breaking any bookmarked
-    // /restaurant/<id> link, any Telegram account already linked to that
-    // restaurant, and any past order's restaurantId reference.
-    const rest = {
+// ---- 200 NUMBERED RESTAURANT SLOTS (001-200) ----
+// These are blank/placeholder slots reserved up front, NOT demo/fake
+// restaurants. Each carries a permanent 3-digit `code` (001-200) that the
+// Super Admin uses in Telegram (/show 001, /hide 001) to control visibility
+// on the live website. A slot starts EMPTY (status:'DRAFT', isVisible:false)
+// and gets filled in when a real restaurant registers and is approved - see
+// claimNextOpenSlot() in the registration route below. Codes/ids never
+// change once created, so bookmarked links, Telegram account links, and
+// past order.restaurantId references never break on reseed.
+const TOTAL_RESTAURANT_SLOTS = 200;
+function seedRestaurantSlotsIfEmpty(){
+  if(db.restaurants.length!==0) return false;
+  for(let n=1;n<=TOTAL_RESTAURANT_SLOTS;n++){
+    const code = String(n).padStart(3,'0');
+    const id = `rest-${code}`;
+    db.restaurants.push({
       id,
-      name: r.name,
-      ownerName: "Demo Owner",
-      phone: "999999999"+(i%10),
-      email: `owner${i}@demo.com`,
-      address: r.address,
-      city: r.city,
-      cuisine: r.cuisine,
-      description: `${r.name} - Premium dining by the waterfall theme. Authentic ${r.cuisine} crafted with love.`,
-      logoUrl: `https://picsum.photos/seed/${id}logo/200/200`,
-      coverUrl: `https://picsum.photos/seed/${id}cover/800/400`,
-      status: 'LIVE',
-      isPinned: i<3,
-      isHighlighted: i%4===0,
-      isOpen: true,
+      code,                    // permanent 3-digit identifier, e.g. "001"
+      name: `Slot ${code} (unassigned)`,
+      ownerName: null,
+      phone: null,
+      email: null,
+      address: '',
+      city: '',
+      cuisine: '',
+      description: '',
+      logoUrl: null,
+      coverUrl: null,
+      status: 'DRAFT',         // DRAFT (empty slot) -> PENDING -> APPROVED -> LIVE
+      isVisible: false,        // separate admin-only gate; see /api/restaurants filter
+      isPinned: false,
+      isHighlighted: false,
+      isOpen: false,
       isBusy: false,
-      deliveryFee: r.deliveryFee,
-      minOrder: r.minOrder,
-      deliveryTime: r.deliveryTime,
-      rating: r.rating,
-      openingHours: "10:00-22:30",
-      upiId: `demo${i}@upi`,
+      deliveryFee: 30,
+      minOrder: 149,
+      deliveryTime: "25-35 min",
+      rating: 0,
+      openingHours: '',
+      upiId: '',
       upiQrUrl: null,
       createdAt: new Date().toISOString(),
-      passwordHash: bcrypt.hashSync("demo1234", 8),
-      // Placeholder restaurant seeded so the site isn't empty on day one.
-      // Marked so a real restaurant going LIVE can bump one of these off
-      // the site automatically instead of the two sitting side by side
-      // forever - see replaceDemoRestaurantIfAny() below.
-      isDemo: true
-    };
-    db.restaurants.push(rest);
-    // categories per restaurant
-    const catNames = [["🍔 Burgers","Burgers"],["🍕 Pizza","Pizza"],["🍜 Noodles","Noodles"],["🍗 Chicken","Chicken"],["🥗 Veg","Vegetarian"],["🍟 Snacks","Snacks"],["🍰 Desserts","Desserts"],["🥤 Drinks","Drinks"]];
-    catNames.slice(0,4).forEach((cn, idx)=>{
-      const catId = uuidv4();
-      db.categories.push({id:catId, restaurantId:id, name:cn[1], emoji:cn[0].split(' ')[0], sortOrder:idx});
-      // 3 items per cat
-      for(let k=0;k<3;k++){
-        db.menuItems.push({
-          id: uuidv4(),
-          restaurantId:id,
-          categoryId: catId,
-          name: `${cn[1]} Special ${k+1}`,
-          description: `Delicious ${cn[1].toLowerCase()} made with premium ingredients, served fresh.`,
-          price: 149 + (idx*30) + (k*50) + (i%3)*10,
-          imageUrl: `https://picsum.photos/seed/${id}${catId}${k}/400/300`,
-          isVeg: r.isVeg || (k%2===0),
-          isAvailable: true,
-          prepTime: "15-20 min",
-          sortOrder: k
-        });
-      }
+      passwordHash: null
     });
-  });
+  }
   saveDB();
+  return true;
+}
+// Runs once at boot: tries to restore restaurant/menu content from GitHub
+// first (source of truth when configured), and only falls back to seeding
+// 200 blank slots if that didn't produce anything. Resolving this BEFORE
+// app.listen() (see the very bottom of this file) avoids serving requests
+// off an empty/half-initialized db during the brief window a cold boot
+// takes to reach GitHub.
+async function bootstrapContent(){
+  const restored = await loadContentFromGitHub();
+  if(restored){
+    // Real content came back from git - this was not actually a loss, just
+    // Render's normal ephemeral-disk restart. Don't alarm the admin over it.
+    dbLikelyWiped = false;
+    console.log(`Slots in use after GitHub restore: ${db.restaurants.filter(r=>r.status!=='DRAFT').length}/${TOTAL_RESTAURANT_SLOTS}`);
+  }
+  const seeded = seedRestaurantSlotsIfEmpty();
+  if(seeded && githubConfigured()){
+    // First-ever boot with GitHub configured but no content file in the
+    // repo yet - commit the initial 200 blank slots so they exist in git
+    // (as "the code") from this point forward.
+    await syncContentToGitHub('initial 200-slot seed');
+  }
+}
+const contentBootstrapPromise = bootstrapContent();
+// real restaurant. Used by registration instead of minting a brand new id,
+// so every restaurant that ever exists on this platform has a stable
+// 3-digit code the admin can reference in Telegram.
+function claimNextOpenSlot(){
+  const open = db.restaurants
+    .filter(r=>r.status==='DRAFT')
+    .sort((a,b)=> a.code.localeCompare(b.code));
+  return open[0] || null;
 }
 
 // ================= HELPERS =================
@@ -190,6 +270,81 @@ function generateOrderCode(){
 function logAudit(who, what, target, prev=null, next=null){
   db.auditLogs.push({id:uuidv4(), who, what, target, prev, next, when:new Date().toISOString()});
   saveDB();
+}
+
+// ---- REVIEW-BEFORE-PUBLISH PIPELINE ----
+// Every item/price/image a restaurant submits from Telegram lands here
+// first as a PENDING change - nothing touches the live menu (and therefore
+// nothing a customer sees) until the Super Admin taps APPROVE. This is the
+// "everything goes through me first" control the admin asked for. Applying
+// a change only ever writes db.menuItems[].price/name/etc - it never
+// touches an already-placed order, since orders always store their own
+// price snapshot taken at checkout time (see POST /api/orders above).
+function submitForReview(restaurant, type, payload, summary){
+  const change = {
+    id: uuidv4(),
+    restaurantId: restaurant.id,
+    code: restaurant.code,
+    restaurantName: restaurant.name,
+    type, // 'ADD_ITEM' | 'EDIT_PRICE' | 'EDIT_ITEM' | 'ITEM_IMAGE'
+    payload,
+    summary,
+    status: 'PENDING',
+    createdAt: new Date().toISOString()
+  };
+  db.pendingChanges.push(change);
+  saveDB();
+  logAudit('restaurant:'+restaurant.id, 'SUBMIT_CHANGE_'+type, change.id, null, change);
+  if(bot && SUPER_ADMIN_IDS.length){
+    const text = `📝 CHANGE SUBMITTED FOR REVIEW\n[${restaurant.code}] ${restaurant.name}\n\n${summary}\n\nNothing goes live on the website until you approve this.`;
+    for(const adminId of SUPER_ADMIN_IDS){
+      bot.telegram.sendMessage(adminId, text, {reply_markup:{inline_keyboard:[
+        [{text:'✅ APPROVE & PUBLISH', callback_data:'pc_approve_'+change.id}, {text:'❌ REJECT', callback_data:'pc_reject_'+change.id}]
+      ]}}).catch(e=>console.error('submitForReview notify failed', e.message));
+    }
+  }
+  return change;
+}
+function applyPendingChange(change){
+  const restaurant = db.restaurants.find(r=>r.id===change.restaurantId);
+  if(!restaurant) return {ok:false, error:'Restaurant no longer exists'};
+  if(change.type==='ADD_ITEM'){
+    const { name, price, catName } = change.payload;
+    let category = db.categories.find(c=>c.restaurantId===restaurant.id && c.name.toLowerCase()===(catName||'General').toLowerCase());
+    if(!category){
+      category = {id:uuidv4(), restaurantId:restaurant.id, name:catName||'General', emoji:'🍔', sortOrder:db.categories.filter(c=>c.restaurantId===restaurant.id).length};
+      db.categories.push(category);
+    }
+    const item = {
+      id: uuidv4(),
+      restaurantId: restaurant.id,
+      categoryId: category.id,
+      name,
+      description: `${name} - delicious, freshly made.`,
+      price,
+      imageUrl: `https://picsum.photos/seed/${Date.now()}/400/300`,
+      isVeg: false,
+      isAvailable: true,
+      prepTime: "15-20 min",
+      sortOrder: db.menuItems.filter(i=>i.restaurantId===restaurant.id).length
+    };
+    db.menuItems.push(item);
+  } else if(change.type==='EDIT_PRICE'){
+    const item = db.menuItems.find(i=>i.id===change.payload.itemId && i.restaurantId===restaurant.id);
+    if(!item) return {ok:false, error:'Item no longer exists'};
+    // Only the live price field changes. Every order already placed keeps
+    // the unitPrice it snapshotted at checkout - this can never retroactively
+    // change a past order's total.
+    item.price = change.payload.newPrice;
+  } else if(change.type==='ITEM_IMAGE'){
+    const item = db.menuItems.find(i=>i.id===change.payload.itemId && i.restaurantId===restaurant.id);
+    if(!item) return {ok:false, error:'Item no longer exists'};
+    item.imageUrl = change.payload.imageUrl;
+  } else {
+    return {ok:false, error:'Unknown change type'};
+  }
+  saveDB();
+  return {ok:true};
 }
 function findRestaurantByTelegramUser(telegramUserId){
   const acc = db.telegramAccounts.find(a=>a.telegramUserId===Number(telegramUserId));
@@ -286,7 +441,11 @@ app.get('/api/config', (req,res)=>{
 // ---- RESTAURANTS ----
 app.get('/api/restaurants', (req,res)=>{
   const q = (req.query.q||'').toLowerCase();
-  let list = db.restaurants.filter(r=>r.status==='LIVE');
+  // A restaurant only ever appears to customers when BOTH are true:
+  // (1) it went LIVE itself (menu+payment+hours set, via /golive), AND
+  // (2) the Super Admin explicitly allowed it via Telegram (/show <code>).
+  // (1) alone is not enough - this is the deliberate admin visibility gate.
+  let list = db.restaurants.filter(r=>r.status==='LIVE' && r.isVisible===true);
   if(q){
     list = list.filter(r=> r.name.toLowerCase().includes(q) || r.cuisine.toLowerCase().includes(q));
   }
@@ -303,7 +462,7 @@ app.get('/api/restaurants', (req,res)=>{
 
 app.get('/api/restaurants/:id', (req,res)=>{
   const r = db.restaurants.find(x=>x.id===req.params.id);
-  if(!r) return res.status(404).json({error:'Not found'});
+  if(!r || r.status!=='LIVE' || r.isVisible!==true) return res.status(404).json({error:'Not found'});
   const categories = db.categories.filter(c=>c.restaurantId===r.id).sort((a,b)=>a.sortOrder-b.sortOrder);
   const items = db.menuItems.filter(i=>i.restaurantId===r.id);
   res.json({...publicRestaurant(r), categories, items});
@@ -348,9 +507,14 @@ app.post('/api/restaurants/register', async (req,res)=>{
     if(db.restaurants.find(r=>r.email===email) || db.applications.find(a=>a.email===email && a.status==='PENDING')){
       return res.status(409).json({error:'Application already exists'});
     }
-    const id = uuidv4();
+    const slot = claimNextOpenSlot();
+    if(!slot){
+      return res.status(409).json({error:'All 200 restaurant slots are full. Contact the admin.'});
+    }
+    const id = slot.id; // reuse the pre-numbered slot's stable id/code - never mint a new one
     const appEntry = {
       id,
+      code: slot.code,
       restaurantName: name,
       ownerName,
       phone,
@@ -368,9 +532,9 @@ app.post('/api/restaurants/register', async (req,res)=>{
       passwordHash: bcrypt.hashSync(password, 10)
     };
     db.applications.push(appEntry);
-    // create restaurant in pending
-    db.restaurants.push({
-      id,
+    // fill in the reserved slot - keep its id/code, isVisible stays false
+    // until the Super Admin explicitly allows it via /show <code> in Telegram
+    Object.assign(slot, {
       name,
       ownerName,
       phone,
@@ -383,6 +547,7 @@ app.post('/api/restaurants/register', async (req,res)=>{
       logoUrl: null,
       coverUrl: null,
       status: 'PENDING',
+      isVisible: false,
       isPinned:false,
       isHighlighted:false,
       isOpen:false,
@@ -393,8 +558,7 @@ app.post('/api/restaurants/register', async (req,res)=>{
       rating:4.5,
       upiId: upiId||'',
       upiQrUrl:null,
-      passwordHash: appEntry.passwordHash,
-      createdAt: new Date().toISOString()
+      passwordHash: appEntry.passwordHash
     });
     saveDB();
     logAudit('restaurant:'+email, 'REGISTER', id);
@@ -402,7 +566,7 @@ app.post('/api/restaurants/register', async (req,res)=>{
     // Silent admin notification via Telegram
     await notifySuperAdminNewRegistration(appEntry);
 
-    res.json({ok:true, message:'Registration submitted. Awaiting admin approval.', id});
+    res.json({ok:true, message:'Registration submitted. Awaiting admin approval.', id, code: slot.code});
   }catch(e){
     console.error(e);
     res.status(500).json({error:'Server error'});
@@ -433,7 +597,7 @@ app.post('/api/orders', (req,res)=>{
     }
     if(db.systemPaused) return res.status(503).json({error:'Ordering is temporarily paused. Please try again shortly.'});
     const restaurant = db.restaurants.find(r=>r.id===restaurantId);
-    if(!restaurant || restaurant.status!=='LIVE') return res.status(400).json({error:'Restaurant unavailable'});
+    if(!restaurant || restaurant.status!=='LIVE' || restaurant.isVisible!==true) return res.status(400).json({error:'Restaurant unavailable'});
     if(!restaurant.isOpen) return res.status(400).json({error:'Restaurant closed'});
 
     // snapshot prices from DB - never trust browser totals
@@ -576,7 +740,7 @@ if(TELEGRAM_BOT_TOKEN){
   });
 
   function showSuperAdminMenu(ctx){
-    return ctx.reply(`👑 SUPER ADMIN\nWelcome to Control Center\nOrdering: ${db.systemPaused ? '⏸ PAUSED' : '🟢 ACTIVE'}\n\n💾 data.json is sent here automatically whenever a restaurant goes live or updates its info. Send /backup anytime for an on-demand copy. If data ever resets, reply /restore to the latest file.`, Markup.inlineKeyboard([
+    return ctx.reply(`👑 SUPER ADMIN\nWelcome to Control Center\nOrdering: ${db.systemPaused ? '⏸ PAUSED' : '🟢 ACTIVE'}\nSlots used: ${db.restaurants.filter(r=>r.status!=='DRAFT').length}/${TOTAL_RESTAURANT_SLOTS}\n\n👁 VISIBILITY: /show 001 makes restaurant 001 visible on the website, /hide 001 hides it. This is the only way a restaurant becomes visible - required even after it goes LIVE.\n\n✏️ PENDING EDITS: /pending lists menu/price/image changes submitted by restaurants that are waiting for your approval before they go live.\n\n💾 data.json is sent here automatically whenever a restaurant goes live or updates its info. Send /backup anytime for an on-demand copy. If data ever resets, reply /restore to the latest file.`, Markup.inlineKeyboard([
       [Markup.button.callback('🏪 Restaurants','sa_restaurants')],
       [Markup.button.callback('📦 Orders','sa_orders'), Markup.button.callback('💳 Payments','sa_payments')],
       [Markup.button.callback('📊 Analytics','sa_analytics'), Markup.button.callback('🩺 System Health','sa_health')],
@@ -606,12 +770,28 @@ if(TELEGRAM_BOT_TOKEN){
         if(!isSuperAdmin(tgUserId)) return ctx.answerCbQuery('Unauthorized');
         if(data==='sa_restaurants'){
           const pending = db.applications.filter(a=>a.status==='PENDING');
-          if(pending.length===0) return ctx.reply('No pending applications. Live restaurants: '+db.restaurants.filter(r=>r.status==='LIVE').length);
           for(const app of pending.slice(0,5)){
-            await ctx.reply(`🏪 NEW REGISTRATION\n${app.restaurantName}\nOwner: ${app.ownerName}\nPhone: ${app.phone}\nEmail: ${app.email}\nCuisine: ${app.cuisine}\nHours: ${app.openingHours}`, Markup.inlineKeyboard([
+            await ctx.reply(`🏪 NEW REGISTRATION [${app.code}]\n${app.restaurantName}\nOwner: ${app.ownerName}\nPhone: ${app.phone}\nEmail: ${app.email}\nCuisine: ${app.cuisine}\nHours: ${app.openingHours}`, Markup.inlineKeyboard([
               [Markup.button.callback('✅ APPROVE','approve_'+app.id), Markup.button.callback('❌ REJECT','reject_'+app.id)],
               [Markup.button.callback('👀 VIEW DETAILS','view_'+app.id)]
             ]));
+          }
+          // Restaurants that finished their own setup (/golive) but are still
+          // hidden from customers until you explicitly allow them below.
+          const awaitingVisibility = db.restaurants.filter(r=>r.status==='LIVE' && !r.isVisible);
+          if(awaitingVisibility.length){
+            await ctx.reply(`👁 ${awaitingVisibility.length} restaurant(s) are LIVE but HIDDEN from the website. Tap to allow them:`, Markup.inlineKeyboard(
+              awaitingVisibility.slice(0,15).map(r=>[Markup.button.callback(`✅ SHOW [${r.code}] ${r.name}`, 'sa_show_'+r.id)])
+            ));
+          }
+          const visibleNow = db.restaurants.filter(r=>r.status==='LIVE' && r.isVisible);
+          if(visibleNow.length){
+            await ctx.reply(`🌐 ${visibleNow.length} restaurant(s) currently visible on the website. Tap to hide:`, Markup.inlineKeyboard(
+              visibleNow.slice(0,15).map(r=>[Markup.button.callback(`🚫 HIDE [${r.code}] ${r.name}`, 'sa_hide_'+r.id)])
+            ));
+          }
+          if(pending.length===0 && awaitingVisibility.length===0 && visibleNow.length===0){
+            return ctx.reply('No pending applications and no restaurants yet. Slots used: '+db.restaurants.filter(r=>r.status!=='DRAFT').length+'/'+TOTAL_RESTAURANT_SLOTS);
           }
           return;
         }
@@ -676,8 +856,20 @@ if(TELEGRAM_BOT_TOKEN){
           else { return ctx.answerCbQuery('Restaurant is not live'); }
           saveDB();
           logAudit('superadmin:'+tgUserId, r.status==='SUSPENDED' ? 'SUSPEND_RESTAURANT' : 'UNSUSPEND_RESTAURANT', r.id);
-          sendBackupToAdmins((r.status==='SUSPENDED' ? 'suspend:' : 'unsuspend:')+r.name).catch(e=>console.error('backup send failed', e.message));
+          persistContentChange((r.status==='SUSPENDED' ? 'suspend:' : 'unsuspend:')+r.name).catch(e=>console.error('backup send failed', e.message));
           return ctx.editMessageText(`${r.name} is now ${r.status==='SUSPENDED' ? '🚫 SUSPENDED (hidden from customers, no new orders)' : '🟢 LIVE again'}`);
+        }
+        if(data.startsWith('sa_show_') || data.startsWith('sa_hide_')){
+          const makeVisible = data.startsWith('sa_show_');
+          const rid = data.replace(makeVisible ? 'sa_show_' : 'sa_hide_','');
+          const r = db.restaurants.find(x=>x.id===rid);
+          if(!r) return ctx.answerCbQuery('Not found');
+          if(r.status!=='LIVE') return ctx.answerCbQuery('Restaurant is not LIVE yet');
+          r.isVisible = makeVisible;
+          saveDB();
+          logAudit('superadmin:'+tgUserId, makeVisible?'SHOW_RESTAURANT':'HIDE_RESTAURANT', r.id);
+          persistContentChange((makeVisible?'show:':'hide:')+r.code).catch(e=>console.error('backup send failed', e.message));
+          return ctx.editMessageText(`[${r.code}] ${r.name} is now ${makeVisible ? '🌐 VISIBLE on the website' : '🚫 HIDDEN from the website'}`);
         }
         if(data==='sa_back'){
           return showSuperAdminMenu(ctx);
@@ -714,6 +906,36 @@ if(TELEGRAM_BOT_TOKEN){
           logAudit('superadmin:'+tgUserId, 'REJECT_RESTAURANT', appId);
         }
         return ctx.editMessageText('❌ Rejected '+appId);
+      }
+
+      if(data.startsWith('pc_approve_') || data.startsWith('pc_reject_')){
+        if(!isSuperAdmin(tgUserId)) return ctx.answerCbQuery('Unauthorized');
+        const approve = data.startsWith('pc_approve_');
+        const changeId = data.replace(approve?'pc_approve_':'pc_reject_','');
+        const change = db.pendingChanges.find(c=>c.id===changeId);
+        if(!change) return ctx.answerCbQuery('Not found (already handled?)');
+        if(change.status!=='PENDING') return ctx.answerCbQuery('Already '+change.status, {show_alert:true});
+        const restaurant = db.restaurants.find(r=>r.id===change.restaurantId);
+        if(approve){
+          const result = applyPendingChange(change);
+          change.status = result.ok ? 'APPROVED' : 'FAILED';
+          saveDB();
+          logAudit('superadmin:'+tgUserId, 'APPROVE_CHANGE', change.id);
+          await ctx.editMessageText(ctx.callbackQuery.message.text + (result.ok ? '\n\n✅ APPROVED & LIVE' : `\n\n⚠️ FAILED: ${result.error}`));
+          if(result.ok){
+            persistContentChange('approve_change:'+change.code).catch(e=>console.error('backup send failed', e.message));
+            const acc = restaurant && db.telegramAccounts.find(a=>a.restaurantId===restaurant.id && a.role==='OWNER');
+            if(acc) bot.telegram.sendMessage(acc.telegramUserId, `✅ Your change was approved and is now live:\n${change.summary}`).catch(()=>{});
+          }
+        } else {
+          change.status = 'REJECTED';
+          saveDB();
+          logAudit('superadmin:'+tgUserId, 'REJECT_CHANGE', change.id);
+          await ctx.editMessageText(ctx.callbackQuery.message.text + '\n\n❌ REJECTED');
+          const acc = restaurant && db.telegramAccounts.find(a=>a.restaurantId===restaurant.id && a.role==='OWNER');
+          if(acc) bot.telegram.sendMessage(acc.telegramUserId, `❌ Your submitted change was rejected by admin:\n${change.summary}`).catch(()=>{});
+        }
+        return;
       }
 
       // RESTAURANT
@@ -796,7 +1018,7 @@ if(TELEGRAM_BOT_TOKEN){
       if(data==='r_menu'){
         const cats = db.categories.filter(c=>c.restaurantId===restaurant.id);
         const items = db.menuItems.filter(i=>i.restaurantId===restaurant.id);
-        return ctx.reply(`🍔 MENU - ${items.length} items in ${cats.length} categories\nUse commands:\n/additem Name | Price | Category\n/edititem\n/deleteitem`, Markup.inlineKeyboard([
+        return ctx.reply(`🍔 MENU - ${items.length} items in ${cats.length} categories\nUse commands:\n/additem Name | Price | Category\n/myitems - list with numbers\n/setprice <number> <new price>\n/itemimage <number> (then send a photo)\n/mycats - list categories\n/renamecat <number> <new name> - goes live instantly\n/reordercat <numbers in new order> - goes live instantly\n\nItems/prices/images go to admin for approval first. Category renames/reorders go live immediately (admin is notified and can override).`, Markup.inlineKeyboard([
           [Markup.button.callback('➕ ADD ITEM','r_add_item')],
           [Markup.button.callback('👀 VIEW MENU','r_view_menu')]
         ]));
@@ -808,13 +1030,13 @@ if(TELEGRAM_BOT_TOKEN){
       if(data==='r_toggle_open'){
         restaurant.isOpen = !restaurant.isOpen;
         saveDB();
-        sendBackupToAdmins('update:toggle_open:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
+        persistContentChange('update:toggle_open:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
         return ctx.editMessageText(`Shop is now ${restaurant.isOpen?'🟢 OPEN':'🔴 CLOSED'}`);
       }
       if(data==='r_toggle_busy'){
         restaurant.isBusy = !restaurant.isBusy;
         saveDB();
-        sendBackupToAdmins('update:toggle_busy:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
+        persistContentChange('update:toggle_busy:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
         return ctx.editMessageText(`Busy mode: ${restaurant.isBusy?'🟡 BUSY':'🟢 Not busy'}`);
       }
       if(data==='r_payments'){
@@ -852,30 +1074,150 @@ if(TELEGRAM_BOT_TOKEN){
     if(!restaurant) return ctx.reply('Not linked');
     const [name, priceStr, catName] = parts;
     const price = Number(priceStr);
-    let category = db.categories.find(c=>c.restaurantId===restaurant.id && c.name.toLowerCase()===(catName||'Burgers').toLowerCase());
-    if(!category){
-      category = {id:uuidv4(), restaurantId:restaurant.id, name:catName||'General', emoji:'🍔', sortOrder:db.categories.filter(c=>c.restaurantId===restaurant.id).length};
-      db.categories.push(category);
-    }
-    const item = {
-      id: uuidv4(),
-      restaurantId: restaurant.id,
-      categoryId: category.id,
-      name,
-      description: `${name} - delicious, freshly made.`,
-      price,
-      imageUrl: `https://picsum.photos/seed/${Date.now()}/400/300`,
-      isVeg: false,
-      isAvailable:true,
-      prepTime:"15-20 min",
-      sortOrder: db.menuItems.filter(i=>i.restaurantId===restaurant.id).length
-    };
-    db.menuItems.push(item);
+    if(!name || !Number.isFinite(price) || price<=0) return ctx.reply('❌ Invalid name or price. Example: /additem Chicken Burger | 250 | Burgers');
+    submitForReview(restaurant, 'ADD_ITEM', {name, price, catName: catName||'General'}, `➕ NEW ITEM\n${name} - ₹${price}\nCategory: ${catName||'General'}`);
+    ctx.reply(`📤 Submitted for admin approval:\n${name} - ₹${price}\nIt will appear on the website once approved.`);
+  });
+
+  // /setprice <itemId> <newPrice> - routed through admin review, same as
+  // adding a new item. Editing a price never touches orders already placed
+  // (those keep their own checkout-time price snapshot), so once approved
+  // it only affects new orders from that point forward.
+  bot.command('setprice', async (ctx)=>{
+    const text = ctx.message.text.replace('/setprice','').trim();
+    const parts = text.split(/\s+/);
+    const restaurant = findRestaurantByTelegramUser(ctx.from.id);
+    if(!restaurant) return ctx.reply('Not linked');
+    if(parts.length<2) return ctx.reply('Usage: /setprice <item number> <new price>\nSend /myitems first to see item numbers.');
+    const idx = Number(parts[0]) - 1;
+    const newPrice = Number(parts[1]);
+    const items = db.menuItems.filter(i=>i.restaurantId===restaurant.id);
+    const item = items[idx];
+    if(!item) return ctx.reply('❌ No item with that number. Send /myitems to see the list.');
+    if(!Number.isFinite(newPrice) || newPrice<=0) return ctx.reply('❌ Invalid price.');
+    submitForReview(restaurant, 'EDIT_PRICE', {itemId:item.id, newPrice}, `💰 PRICE CHANGE\n${item.name}\n₹${item.price} → ₹${newPrice}`);
+    ctx.reply(`📤 Submitted for admin approval:\n${item.name}: ₹${item.price} → ₹${newPrice}\nCurrent price stays live until approved (existing orders are never affected either way).`);
+  });
+
+  bot.command('myitems', async (ctx)=>{
+    const restaurant = findRestaurantByTelegramUser(ctx.from.id);
+    if(!restaurant) return ctx.reply('Not linked');
+    const items = db.menuItems.filter(i=>i.restaurantId===restaurant.id);
+    if(items.length===0) return ctx.reply('No items yet. Add one with /additem Name | Price | Category');
+    ctx.reply(items.map((i,idx)=>`${idx+1}. ${i.name} - ₹${i.price} ${i.isAvailable?'✅':'❌'}`).join('\n')+'\n\nUse /setprice <number> <new price> or /itemimage <number> (then send a photo) to change one.');
+  });
+
+  // /itemimage <item number>, then send a photo in the next message - the
+  // photo handler below picks this up. Also routed through admin review.
+  const pendingItemImage = new Map(); // telegramUserId -> {restaurantId, itemId}
+  bot.command('itemimage', async (ctx)=>{
+    const restaurant = findRestaurantByTelegramUser(ctx.from.id);
+    if(!restaurant) return ctx.reply('Not linked');
+    const idx = Number(ctx.message.text.replace('/itemimage','').trim()) - 1;
+    const items = db.menuItems.filter(i=>i.restaurantId===restaurant.id);
+    const item = items[idx];
+    if(!item) return ctx.reply('❌ No item with that number. Send /myitems to see the list.');
+    pendingItemImage.set(ctx.from.id, {restaurantId:restaurant.id, itemId:item.id, itemName:item.name});
+    ctx.reply(`📷 Now send a photo for "${item.name}". It'll be sent to admin for approval before it goes live.`);
+  });
+
+  // ---- CATEGORY MANAGEMENT ----
+  // Unlike items/prices/images (which need admin approval before going
+  // live), a restaurant renaming or reordering its OWN categories applies
+  // immediately - the customer sees it right away. The admin is still
+  // notified every time (informational, not an approval gate) and can
+  // override any category's name or order at any point with /setcatname or
+  // /setcatorder below - an admin override always wins and stays exactly as
+  // the admin set it until the admin changes it again.
+  bot.command('mycats', async (ctx)=>{
+    const restaurant = findRestaurantByTelegramUser(ctx.from.id);
+    if(!restaurant) return ctx.reply('Not linked');
+    const cats = db.categories.filter(c=>c.restaurantId===restaurant.id).sort((a,b)=>a.sortOrder-b.sortOrder);
+    if(cats.length===0) return ctx.reply('No categories yet - one is created automatically the first time you /additem.');
+    ctx.reply(cats.map((c,idx)=>`${idx+1}. ${c.emoji||''} ${c.name}`.trim()).join('\n')+
+      '\n\nUse /renamecat <number> <new name> or /reordercat <numbers in new order, e.g. 3,1,2>\nBoth go live immediately.');
+  });
+
+  bot.command('renamecat', async (ctx)=>{
+    const restaurant = findRestaurantByTelegramUser(ctx.from.id);
+    if(!restaurant) return ctx.reply('Not linked');
+    const text = ctx.message.text.replace('/renamecat','').trim();
+    const spaceIdx = text.indexOf(' ');
+    if(spaceIdx<0) return ctx.reply('Usage: /renamecat <number> <new name>\nSend /mycats to see numbers.');
+    const idx = Number(text.slice(0,spaceIdx)) - 1;
+    const newName = text.slice(spaceIdx+1).trim();
+    const cats = db.categories.filter(c=>c.restaurantId===restaurant.id).sort((a,b)=>a.sortOrder-b.sortOrder);
+    const cat = cats[idx];
+    if(!cat) return ctx.reply('❌ No category with that number. Send /mycats to see the list.');
+    if(!newName) return ctx.reply('❌ New name cannot be empty.');
+    const oldName = cat.name;
+    cat.name = newName;
     saveDB();
-    logAudit('restaurant:'+restaurant.id, 'ADD_ITEM', item.id, null, item);
-    ctx.reply(`✅ ITEM ADDED\n${item.name} - ₹${item.price}\nCategory: ${category.name}`, {reply_markup:{inline_keyboard:[[{text:'✏️ EDIT', callback_data:'edit_'+item.id}]]}});
-    // Menu changed -> push the admin a fresh data.json (last step of this command).
-    sendBackupToAdmins('update:additem:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
+    logAudit('restaurant:'+restaurant.id, 'RENAME_CATEGORY', cat.id, {name:oldName}, {name:newName});
+    ctx.reply(`✅ Category renamed: "${oldName}" → "${newName}"\nLive on the website now.`);
+    notifyAdminsCategoryChange(restaurant, `✏️ CATEGORY RENAMED\n[${restaurant.code}] ${restaurant.name}\n"${oldName}" → "${newName}"\nAlready live. Override anytime with /setcatname ${restaurant.code} ...`);
+    persistContentChange('update:renamecat:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
+  });
+
+  bot.command('reordercat', async (ctx)=>{
+    const restaurant = findRestaurantByTelegramUser(ctx.from.id);
+    if(!restaurant) return ctx.reply('Not linked');
+    const text = ctx.message.text.replace('/reordercat','').trim();
+    const cats = db.categories.filter(c=>c.restaurantId===restaurant.id).sort((a,b)=>a.sortOrder-b.sortOrder);
+    const order = text.split(',').map(s=>Number(s.trim())-1);
+    if(order.length!==cats.length || order.some(i=>!Number.isInteger(i) || i<0 || i>=cats.length) || new Set(order).size!==order.length){
+      return ctx.reply(`❌ Send all ${cats.length} numbers, each exactly once, comma-separated. Example: /reordercat ${cats.map((_,i)=>i+1).join(',')}\nSend /mycats to see current numbers.`);
+    }
+    order.forEach((origIdx, newPos)=>{ cats[origIdx].sortOrder = newPos; });
+    saveDB();
+    logAudit('restaurant:'+restaurant.id, 'REORDER_CATEGORIES', restaurant.id, null, order);
+    const newOrderNames = order.map(i=>cats[i].name).join(' → ');
+    ctx.reply(`✅ Category order updated: ${newOrderNames}\nLive on the website now.`);
+    notifyAdminsCategoryChange(restaurant, `🔀 CATEGORIES REORDERED\n[${restaurant.code}] ${restaurant.name}\nNew order: ${newOrderNames}\nAlready live. Override anytime with /setcatorder ${restaurant.code} ...`);
+    persistContentChange('update:reordercat:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
+  });
+
+  // Super Admin overrides - same effect as the restaurant commands above,
+  // but by restaurant code and always wins/stays until changed again.
+  bot.command('setcatname', async (ctx)=>{
+    if(!isSuperAdmin(ctx.from.id)) return ctx.reply('Unauthorized');
+    const text = ctx.message.text.replace('/setcatname','').trim();
+    const parts = text.split(' ');
+    if(parts.length<3) return ctx.reply('Usage: /setcatname <code> <category number> <new name>\nExample: /setcatname 001 2 Cold Drinks');
+    const code = parts[0].padStart(3,'0');
+    const idx = Number(parts[1]) - 1;
+    const newName = parts.slice(2).join(' ').trim();
+    const restaurant = db.restaurants.find(r=>r.code===code);
+    if(!restaurant) return ctx.reply(`No restaurant with code ${code}`);
+    const cats = db.categories.filter(c=>c.restaurantId===restaurant.id).sort((a,b)=>a.sortOrder-b.sortOrder);
+    const cat = cats[idx];
+    if(!cat) return ctx.reply('❌ No category with that number for that restaurant.');
+    const oldName = cat.name;
+    cat.name = newName;
+    saveDB();
+    logAudit('superadmin:'+ctx.from.id, 'ADMIN_RENAME_CATEGORY', cat.id, {name:oldName}, {name:newName});
+    persistContentChange('admin_renamecat:'+code).catch(e=>console.error('backup send failed', e.message));
+    ctx.reply(`✅ [${code}] "${oldName}" → "${newName}" - locked in until you change it again.`);
+  });
+  bot.command('setcatorder', async (ctx)=>{
+    if(!isSuperAdmin(ctx.from.id)) return ctx.reply('Unauthorized');
+    const text = ctx.message.text.replace('/setcatorder','').trim();
+    const firstSpace = text.indexOf(' ');
+    if(firstSpace<0) return ctx.reply('Usage: /setcatorder <code> <numbers in new order, e.g. 3,1,2>');
+    const code = text.slice(0,firstSpace).trim().padStart(3,'0');
+    const orderText = text.slice(firstSpace+1).trim();
+    const restaurant = db.restaurants.find(r=>r.code===code);
+    if(!restaurant) return ctx.reply(`No restaurant with code ${code}`);
+    const cats = db.categories.filter(c=>c.restaurantId===restaurant.id).sort((a,b)=>a.sortOrder-b.sortOrder);
+    const order = orderText.split(',').map(s=>Number(s.trim())-1);
+    if(order.length!==cats.length || order.some(i=>!Number.isInteger(i) || i<0 || i>=cats.length) || new Set(order).size!==order.length){
+      return ctx.reply(`❌ Send all ${cats.length} numbers, each exactly once. Current: `+cats.map((c,i)=>`${i+1}.${c.name}`).join(', '));
+    }
+    order.forEach((origIdx, newPos)=>{ cats[origIdx].sortOrder = newPos; });
+    saveDB();
+    logAudit('superadmin:'+ctx.from.id, 'ADMIN_REORDER_CATEGORIES', restaurant.id, null, order);
+    persistContentChange('admin_reordercat:'+code).catch(e=>console.error('backup send failed', e.message));
+    ctx.reply(`✅ [${code}] order updated: ${order.map(i=>cats[i].name).join(' → ')} - locked in until you change it again.`);
   });
 
   bot.command('setupi', async (ctx)=>{
@@ -885,7 +1227,7 @@ if(TELEGRAM_BOT_TOKEN){
     restaurant.upiId = upi;
     saveDB();
     ctx.reply(`✅ UPI Updated: ${upi}`);
-    sendBackupToAdmins('update:setupi:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
+    persistContentChange('update:setupi:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
   });
 
   bot.command('sethours', async (ctx)=>{
@@ -895,24 +1237,8 @@ if(TELEGRAM_BOT_TOKEN){
     restaurant.openingHours = hours;
     saveDB();
     ctx.reply(`✅ Hours updated: ${hours}`);
-    sendBackupToAdmins('update:sethours:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
+    persistContentChange('update:sethours:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
   });
-
-  // A real restaurant going LIVE bumps exactly one placeholder demo
-  // restaurant off the site (deleting it and its categories/menu items),
-  // so the seed listings get replaced one-for-one by genuine partners
-  // instead of sitting alongside them forever. Only ever removes an
-  // isDemo:true restaurant, never a real one, and only one per go-live.
-  // Returns the removed demo restaurant's name, or null if none were left.
-  function replaceDemoRestaurantIfAny(){
-    const demo = db.restaurants.find(r=>r.isDemo);
-    if(!demo) return null;
-    db.restaurants = db.restaurants.filter(r=>r.id!==demo.id);
-    db.categories = db.categories.filter(c=>c.restaurantId!==demo.id);
-    db.menuItems = db.menuItems.filter(i=>i.restaurantId!==demo.id);
-    logAudit('system', 'REMOVE_DEMO_RESTAURANT', demo.id);
-    return demo.name;
-  }
 
   // Shared by both the /golive text command and the tappable "🟢 GO LIVE"
   // button, so typing or tapping does exactly the same thing.
@@ -925,22 +1251,14 @@ if(TELEGRAM_BOT_TOKEN){
     if(!hasHours) return ctx.reply('❌ Set hours with /sethours 10:00-22:00');
     restaurant.status='LIVE';
     restaurant.isOpen=true;
-
-    let removedDemoName = null;
-    if(!restaurant.isDemo){
-      removedDemoName = replaceDemoRestaurantIfAny();
-    }
     saveDB();
     logAudit('restaurant:'+restaurant.id, 'GO_LIVE', restaurant.id);
-    ctx.reply('🟢 GO LIVE SUCCESS! Your restaurant is now visible to customers.'
-      + (removedDemoName ? `\n\n🧹 Also removed the placeholder listing "${removedDemoName}" to make room for you.` : ''));
+    ctx.reply('🟢 GO LIVE SUCCESS! Your restaurant is now visible to customers.');
 
     // Send the admin an updated data.json the moment a restaurant actually
     // goes live — this is the point the data is worth having a fresh copy
-    // of, since Render's free tier wipes the disk on restart. If a demo
-    // restaurant's code/data was just removed, this file is the one to
-    // upload over backend/data.json in GitHub to make that permanent.
-    sendBackupToAdmins('go_live:'+restaurant.name + (removedDemoName ? ` (replaced demo "${removedDemoName}")` : '')).catch(e=>console.error('go-live backup send failed', e.message));
+    // of, since Render's free tier wipes the disk on restart.
+    persistContentChange('go_live:'+restaurant.name).catch(e=>console.error('go-live backup send failed', e.message));
   }
 
   bot.command('golive', async (ctx)=>{
@@ -956,7 +1274,7 @@ if(TELEGRAM_BOT_TOKEN){
     restaurant.deliveryFee = fee;
     saveDB();
     ctx.reply(`Delivery fee set to ₹${fee}`);
-    sendBackupToAdmins('update:setdelivery:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
+    persistContentChange('update:setdelivery:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
   });
 
   bot.command('staffpin', async (ctx)=>{
@@ -974,14 +1292,7 @@ if(TELEGRAM_BOT_TOKEN){
   // controls the bot can restore it, which is why these are admin-gated.
   bot.command('backup', async (ctx)=>{
     if(!isSuperAdmin(ctx.from.id)) return ctx.reply('Unauthorized');
-    // Fire-and-forget, same as every other trigger site below. Awaiting
-    // this here was the second bug: with retries, a slow/failing send can
-    // take well over Telegraf's internal 90s handler timeout, which then
-    // throws an uncaught TimeoutError and crashes the whole process. The
-    // reply below returns instantly; the backup still arrives (or reports
-    // failure) on its own via sendBackupToAdmins()'s own error handling.
-    ctx.reply('⏳ Generating backup, sending it now...');
-    sendBackupToAdmins('manual').catch(e=>console.error('manual backup send failed', e.message));
+    await sendBackupToAdmins('manual');
   });
 
   bot.command('restore', async (ctx)=>{
@@ -1003,6 +1314,43 @@ if(TELEGRAM_BOT_TOKEN){
     }catch(e){
       ctx.reply('❌ Restore failed: '+e.message);
     }
+  });
+
+  // /show 001  and  /hide 001 - the primary way you (Super Admin) control
+  // which of the 200 numbered restaurants customers can actually see and
+  // order from. This is independent of the restaurant's own /golive - a
+  // restaurant can be fully set up and LIVE and still be invisible until
+  // you run this. Visibility is persisted in data.json (and backed up to
+  // your Telegram on every toggle) so it stays exactly as you set it.
+  function setVisibilityByCode(ctx, code, makeVisible){
+    if(!isSuperAdmin(ctx.from.id)) return ctx.reply('Unauthorized');
+    const r = db.restaurants.find(x=>x.code===code);
+    if(!r) return ctx.reply(`No restaurant with code ${code}`);
+    if(r.status!=='LIVE') return ctx.reply(`[${code}] ${r.name} is not LIVE yet (status: ${r.status}) - it must finish its own setup and /golive first.`);
+    r.isVisible = makeVisible;
+    saveDB();
+    logAudit('superadmin:'+ctx.from.id, makeVisible?'SHOW_RESTAURANT':'HIDE_RESTAURANT', r.id);
+    persistContentChange((makeVisible?'show:':'hide:')+code).catch(e=>console.error('backup send failed', e.message));
+    ctx.reply(`[${code}] ${r.name} is now ${makeVisible ? '🌐 VISIBLE on the website' : '🚫 HIDDEN from the website'}`);
+  }
+  bot.command('pending', async (ctx)=>{
+    if(!isSuperAdmin(ctx.from.id)) return ctx.reply('Unauthorized');
+    const pending = db.pendingChanges.filter(c=>c.status==='PENDING');
+    if(pending.length===0) return ctx.reply('✅ No pending changes to review.');
+    for(const change of pending.slice(0,15)){
+      const restaurant = db.restaurants.find(r=>r.id===change.restaurantId);
+      await ctx.reply(`📝 [${change.code}] ${restaurant ? restaurant.name : '?'}\n${change.summary}`, {reply_markup:{inline_keyboard:[
+        [{text:'✅ APPROVE & PUBLISH', callback_data:'pc_approve_'+change.id}, {text:'❌ REJECT', callback_data:'pc_reject_'+change.id}]
+      ]}});
+    }
+  });
+  bot.command('show', (ctx)=>{
+    const code = ctx.message.text.replace('/show','').trim().padStart(3,'0');
+    setVisibilityByCode(ctx, code, true);
+  });
+  bot.command('hide', (ctx)=>{
+    const code = ctx.message.text.replace('/hide','').trim().padStart(3,'0');
+    setVisibilityByCode(ctx, code, false);
   });
 
   bot.command('cancel', async (ctx)=>{
@@ -1042,14 +1390,24 @@ if(TELEGRAM_BOT_TOKEN){
     try{
       const fileId = ctx.message.photo[ctx.message.photo.length-1].file_id;
       const fileLink = await ctx.telegram.getFileLink(fileId);
-      // In production download and save. Here store link
+
+      const itemImageReq = pendingItemImage.get(ctx.from.id);
+      if(itemImageReq && itemImageReq.restaurantId===restaurant.id){
+        pendingItemImage.delete(ctx.from.id);
+        submitForReview(restaurant, 'ITEM_IMAGE', {itemId:itemImageReq.itemId, imageUrl:fileLink.href}, `🖼 IMAGE CHANGE\n${itemImageReq.itemName}`);
+        return ctx.reply(`📤 Image submitted for admin approval on "${itemImageReq.itemName}". It'll appear on the website once approved.`);
+      }
+
+      // No pending /itemimage request -> treat any photo as a payment QR
+      // update. This one applies immediately (it's payment routing info the
+      // restaurant needs live right away), not a content/menu change.
       restaurant.upiQrUrl = fileLink.href;
       saveDB();
       logAudit('restaurant:'+restaurant.id, 'UPDATE_QR', restaurant.id);
-      ctx.reply('📷 QR RECEIVED\n✅ PAYMENT QR UPDATED\n\nSending any photo here updates your payment QR. Menu item photos will get their own upload flow separately.', {reply_markup:{inline_keyboard:[[{text:'👀 PREVIEW', url: fileLink.href}]]}});
-      sendBackupToAdmins('update:qr:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
+      ctx.reply('📷 QR RECEIVED\n✅ PAYMENT QR UPDATED\n\nTip: to change a menu item\'s photo instead, send /itemimage <item number> first, then the photo.', {reply_markup:{inline_keyboard:[[{text:'👀 PREVIEW', url: fileLink.href}]]}});
+      persistContentChange('update:qr:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
     }catch(e){
-      ctx.reply('Failed to save QR');
+      ctx.reply('Failed to process photo');
     }
   });
 
@@ -1068,7 +1426,13 @@ if(TELEGRAM_BOT_TOKEN){
 
   // Launch bot in polling mode if not webhook
   if(process.env.NODE_ENV !== 'production'){
-    bot.launch().then(()=>console.log('Telegram bot polling started')).catch(e=>console.error('Bot launch failed', e.message));
+    bot.launch().then(()=>{
+      console.log('Telegram bot polling started');
+      warnAdminsIfDbLikelyWiped();
+    }).catch(e=>console.error('Bot launch failed', e.message));
+  } else {
+    // In production (webhook mode) the bot is ready as soon as it's constructed.
+    warnAdminsIfDbLikelyWiped();
   }
   // No startup/scheduled auto-backup on purpose — per request, data.json is
   // only pushed to admins on GO LIVE and on a restaurant data update (see
@@ -1079,12 +1443,38 @@ if(TELEGRAM_BOT_TOKEN){
   app.post('/telegram/webhook', (req,res)=> res.json({ok:true, disabled:true}));
 }
 
+// Fires once, right after boot, only when data.json was missing AND no
+// persistent DATA_DIR is configured - i.e. Render's Free ephemeral disk
+// almost certainly just wiped it and the 200 slots got reseeded blank.
+// Tells the admin exactly what to do instead of letting it pass silently.
+async function warnAdminsIfDbLikelyWiped(){
+  await contentBootstrapPromise; // don't check dbLikelyWiped until GitHub restore had its chance to clear it
+  if(!dbLikelyWiped || !bot || SUPER_ADMIN_IDS.length===0) return;
+  const text = githubConfigured()
+    ? `⚠️ SERVER RESTARTED WITH NO data.json FOUND, and GitHub restore also came back empty.\n\nEither this is genuinely the first-ever boot, or GITHUB_TOKEN/GITHUB_REPO is misconfigured - check the logs.\n\nIf you have a recent 💾 backup file in this chat, reply to it with /restore.`
+    : `⚠️ SERVER RESTARTED WITH NO data.json FOUND\n\nThis usually means Render's free ephemeral disk was wiped and all 200 slots just got reseeded BLANK - any restaurants you'd filled in may be gone from this running server (their data still exists in your most recent backup here in this chat).\n\nTo restore: find my most recent 💾 data.json file in this chat and reply to it with /restore.\n\nTo stop this happening for good: set GITHUB_TOKEN + GITHUB_REPO in Render's env vars so restaurant/menu content is committed straight to your repo and restored automatically on every boot - see the GITHUB-BACKED CONTENT PERSISTENCE comment near the top of backend/server.js.`;
+  for(const adminId of SUPER_ADMIN_IDS){
+    bot.telegram.sendMessage(adminId, text).catch(e=>console.error('warnAdminsIfDbLikelyWiped failed', adminId, e.message));
+  }
+}
+
 // ================= NOTIFICATIONS (single source of truth) =================
 // These are the ONLY definitions of these functions. Every route that
 // creates/updates an order or a registration calls these directly. When
 // TELEGRAM_BOT_TOKEN isn't set, `bot` is null and each function just logs
 // and returns - the sign-in/approval/order flow still "completes" from the
 // website's point of view, it just won't reach a real Telegram chat.
+// Informational only - the category change already went live before this
+// fires. Just keeps the admin aware, since they retain override power via
+// /setcatname and /setcatorder regardless.
+async function notifyAdminsCategoryChange(restaurant, text){
+  if(!bot || SUPER_ADMIN_IDS.length===0) return;
+  for(const adminId of SUPER_ADMIN_IDS){
+    try{ await bot.telegram.sendMessage(adminId, text); }
+    catch(e){ console.error('notifyAdminsCategoryChange failed', adminId, e.message); }
+  }
+}
+
 async function notifySuperAdminNewRegistration(appData){
   if(!bot){ console.log('Mock: would notify admin of new registration', appData.restaurantName); return; }
   if(SUPER_ADMIN_IDS.length===0){ console.log('No SUPER_ADMIN_TELEGRAM_IDS configured, skipping telegram notify'); return; }
@@ -1180,7 +1570,7 @@ async function notifyRestaurantReceipt(order, localFilePath, mimetype){
 // "socket hang up" from Render -> Telegram on file uploads is usually a
 // transient dropped connection, not a real error - a short retry clears it
 // almost every time without needing any config change.
-async function withRetries(fn, attempts=3, delayMs=800){
+async function withRetries(fn, attempts=3, delayMs=1500){
   let lastErr;
   for(let i=1;i<=attempts;i++){
     try{ return await fn(); }
@@ -1195,6 +1585,21 @@ async function withRetries(fn, attempts=3, delayMs=800){
   throw lastErr;
 }
 
+// Fires on every restaurant/menu/category/pending-change mutation, from
+// both Telegram commands and the website admin dashboard. Does two things
+// in parallel: (1) pushes a data.json snapshot to your Telegram (the
+// existing safety net), and (2) commits the content fields straight to
+// GitHub (see GITHUB-BACKED CONTENT PERSISTENCE above) so the change is
+// "in the code" and survives a Render reset with no manual step at all,
+// whenever GITHUB_TOKEN/GITHUB_REPO are configured. Both are fire-and-forget
+// from call sites - a slow/failed backup never blocks the actual response
+// to the restaurant, admin, or customer.
+function persistContentChange(label){
+  return Promise.allSettled([
+    sendBackupToAdmins(label),
+    syncContentToGitHub(label)
+  ]);
+}
 async function sendBackupToAdmins(triggeredBy='auto'){
   if(!bot){ console.log('sendBackupToAdmins skipped: TELEGRAM_BOT_TOKEN not set'); return; }
   if(SUPER_ADMIN_IDS.length===0){ console.log('sendBackupToAdmins skipped: SUPER_ADMIN_TELEGRAM_IDS not set'); return; }
@@ -1335,7 +1740,9 @@ app.post('/api/admin/restaurants/:id/suspend', requireAdminKey, (req,res)=>{
 app.patch('/api/admin/restaurants/:id', requireAdminKey, (req,res)=>{
   const r = db.restaurants.find(x=>x.id===req.params.id);
   if(!r) return res.status(404).json({error:'Not found'});
-  const allowed = ['deliveryFee','minOrder','commissionRate','openingHours','cuisine','city'];
+  // The website admin dashboard (image + basic-info edits) uses this route.
+  // Everything else (visibility, suspend, pin, approvals) stays Telegram-only.
+  const allowed = ['name','description','deliveryFee','minOrder','commissionRate','openingHours','cuisine','city'];
   const prev = {};
   const next = {};
   for(const key of allowed){
@@ -1346,8 +1753,131 @@ app.patch('/api/admin/restaurants/:id', requireAdminKey, (req,res)=>{
     }
   }
   saveDB();
-  logAudit('superadmin', 'UPDATE_RESTAURANT', r.id, prev, next);
+  logAudit('superadmin:webdashboard', 'UPDATE_RESTAURANT', r.id, prev, next);
+  // Persisted to disk above, but Render's free tier has no persistent disk -
+  // this push to your Telegram is what actually survives a restart. Every
+  // website edit now backs up exactly like a Telegram edit does, so nothing
+  // you save here is ever quietly lost.
+  persistContentChange('webdashboard:update_restaurant:'+r.code).catch(e=>console.error('backup send failed', e.message));
   res.json(publicRestaurant(r));
+});
+
+// ---- ADMIN: single restaurant + its menu, regardless of visibility ----
+// (the public GET /api/restaurants/:id above deliberately 404s anything not
+// LIVE+visible - the admin dashboard needs to see and edit hidden/draft
+// slots too, so it uses this admin-key-gated route instead.)
+app.get('/api/admin/restaurants/:id', requireAdminKey, (req,res)=>{
+  const r = db.restaurants.find(x=>x.id===req.params.id);
+  if(!r) return res.status(404).json({error:'Not found'});
+  const categories = db.categories.filter(c=>c.restaurantId===r.id).sort((a,b)=>a.sortOrder-b.sortOrder);
+  const items = db.menuItems.filter(i=>i.restaurantId===r.id);
+  res.json({...publicRestaurant(r), categories, items});
+});
+
+// ---- ADMIN: image uploads (logo / cover / menu item) ----
+// This is the ENTIRE purpose of the website admin dashboard per the owner's
+// instructions: upload/replace images (plus the basic name/price/description
+// edits above). Everything else stays Telegram-only.
+app.post('/api/admin/restaurants/:id/logo', requireAdminKey, upload.single('image'), (req,res)=>{
+  const r = db.restaurants.find(x=>x.id===req.params.id);
+  if(!r) return res.status(404).json({error:'Not found'});
+  if(!req.file) return res.status(400).json({error:'No file'});
+  r.logoUrl = `/uploads/${req.file.filename}`;
+  saveDB();
+  logAudit('superadmin:webdashboard', 'UPDATE_LOGO', r.id);
+  persistContentChange('webdashboard:update_logo:'+r.code).catch(e=>console.error('backup send failed', e.message));
+  res.json({ok:true, logoUrl:r.logoUrl});
+});
+app.post('/api/admin/restaurants/:id/cover', requireAdminKey, upload.single('image'), (req,res)=>{
+  const r = db.restaurants.find(x=>x.id===req.params.id);
+  if(!r) return res.status(404).json({error:'Not found'});
+  if(!req.file) return res.status(400).json({error:'No file'});
+  r.coverUrl = `/uploads/${req.file.filename}`;
+  saveDB();
+  logAudit('superadmin:webdashboard', 'UPDATE_COVER', r.id);
+  persistContentChange('webdashboard:update_cover:'+r.code).catch(e=>console.error('backup send failed', e.message));
+  res.json({ok:true, coverUrl:r.coverUrl});
+});
+
+// ---- ADMIN: menu item edits (name/price/description) + image ----
+app.patch('/api/admin/menu-items/:id', requireAdminKey, (req,res)=>{
+  const item = db.menuItems.find(i=>i.id===req.params.id);
+  if(!item) return res.status(404).json({error:'Not found'});
+  const allowed = ['name','price','description','isAvailable','isVeg'];
+  const prev = {}; const next = {};
+  for(const key of allowed){
+    if(req.body[key] !== undefined){
+      prev[key] = item[key];
+      // Price stays a plain number straight into item.price - the exact
+      // same field every order snapshot reads from at checkout. No separate
+      // "display price" vs "charge price" to ever drift apart.
+      item[key] = key==='price' ? Number(req.body[key]) : req.body[key];
+      next[key] = item[key];
+    }
+  }
+  saveDB();
+  logAudit('superadmin:webdashboard', 'UPDATE_MENU_ITEM', item.id, prev, next);
+  const owner = db.restaurants.find(r=>r.id===item.restaurantId);
+  persistContentChange('webdashboard:update_item:'+(owner?owner.code:item.restaurantId)).catch(e=>console.error('backup send failed', e.message));
+  res.json(item);
+});
+app.post('/api/admin/menu-items/:id/image', requireAdminKey, upload.single('image'), (req,res)=>{
+  const item = db.menuItems.find(i=>i.id===req.params.id);
+  if(!item) return res.status(404).json({error:'Not found'});
+  if(!req.file) return res.status(400).json({error:'No file'});
+  item.imageUrl = `/uploads/${req.file.filename}`;
+  saveDB();
+  logAudit('superadmin:webdashboard', 'UPDATE_ITEM_IMAGE', item.id);
+  const owner = db.restaurants.find(r=>r.id===item.restaurantId);
+  persistContentChange('webdashboard:update_item_image:'+(owner?owner.code:item.restaurantId)).catch(e=>console.error('backup send failed', e.message));
+  res.json({ok:true, imageUrl:item.imageUrl});
+});
+
+// ---- ADMIN: pending changes (mirrors the Telegram /pending approve/reject) ----
+// GET returns each change's restaurantId/code/type/payload/summary exactly
+// as the restaurant submitted it - the admin dashboard uses this to prefill
+// an editable form, so you can fix a typo or adjust a price before it goes
+// live, without bouncing back to the restaurant on Telegram.
+app.get('/api/admin/pending-changes', requireAdminKey, (req,res)=>{
+  res.json(db.pendingChanges.filter(c=>c.status==='PENDING'));
+});
+app.post('/api/admin/pending-changes/:id/approve', requireAdminKey, (req,res)=>{
+  const change = db.pendingChanges.find(c=>c.id===req.params.id);
+  if(!change) return res.status(404).json({error:'Not found'});
+  if(change.status!=='PENDING') return res.status(409).json({error:'Already '+change.status});
+  // Any field the admin edited on the website overrides what the restaurant
+  // submitted; anything left untouched keeps the restaurant's original
+  // value. Prices still go through the same item.price field every order
+  // snapshots at checkout, so this can't desync display vs. charge.
+  if(req.body && typeof req.body === 'object'){
+    const overrides = {};
+    if(req.body.name !== undefined) overrides.name = req.body.name;
+    if(req.body.price !== undefined) overrides.price = Number(req.body.price);
+    if(req.body.newPrice !== undefined) overrides.newPrice = Number(req.body.newPrice);
+    if(req.body.catName !== undefined) overrides.catName = req.body.catName;
+    if(req.body.imageUrl !== undefined) overrides.imageUrl = req.body.imageUrl;
+    change.payload = Object.assign({}, change.payload, overrides);
+  }
+  const result = applyPendingChange(change);
+  change.status = result.ok ? 'APPROVED' : 'FAILED';
+  saveDB();
+  logAudit('superadmin:webdashboard', 'APPROVE_CHANGE', change.id, null, change.payload);
+  if(result.ok) persistContentChange('webdashboard:approve_change:'+change.code).catch(e=>console.error('backup send failed', e.message));
+  const restaurant = db.restaurants.find(r=>r.id===change.restaurantId);
+  if(result.ok && restaurant && bot){
+    const acc = db.telegramAccounts.find(a=>a.restaurantId===restaurant.id && a.role==='OWNER');
+    if(acc) bot.telegram.sendMessage(acc.telegramUserId, `✅ Your change was approved (via website) and is now live:\n${change.summary}`).catch(()=>{});
+  }
+  res.json(result);
+});
+app.post('/api/admin/pending-changes/:id/reject', requireAdminKey, (req,res)=>{
+  const change = db.pendingChanges.find(c=>c.id===req.params.id);
+  if(!change) return res.status(404).json({error:'Not found'});
+  if(change.status!=='PENDING') return res.status(409).json({error:'Already '+change.status});
+  change.status = 'REJECTED';
+  saveDB();
+  logAudit('superadmin:webdashboard', 'REJECT_CHANGE', change.id);
+  res.json({ok:true});
 });
 
 // ---- ADMIN: APPLICATION APPROVAL (mirrors Telegram approve_/reject_ flow) ----
@@ -1433,7 +1963,11 @@ app.use((err,req,res,next)=>{
   res.status(500).json({error:'Something went wrong. Please try again.'});
 });
 
-app.listen(PORT, ()=>{
-  console.log(`Backend running on ${PORT}`);
-  console.log(`Health: http://localhost:${PORT}/health/ready`);
-});
+contentBootstrapPromise
+  .catch(e=>console.error('bootstrapContent failed, starting anyway with whatever local data.json had:', e.message))
+  .then(()=>{
+    app.listen(PORT, ()=>{
+      console.log(`Backend running on ${PORT}`);
+      console.log(`Health: http://localhost:${PORT}/health/ready`);
+    });
+  });

@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Falls — Admin Dashboard</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌊</text></svg>">
+<style>
+  :root{ color-scheme: dark; }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; min-height:100vh; font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+    background:linear-gradient(160deg,#0b1020,#101a2e 60%,#0b1020);
+    color:#f2f4f8; padding:16px;
+  }
+  .wrap{max-width:560px;margin:0 auto;}
+  .card{
+    background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12);
+    backdrop-filter:blur(14px); border-radius:16px; padding:20px; margin-bottom:14px;
+  }
+  h1{font-size:20px; margin:0 0 4px;}
+  h2{font-size:15px; margin:0 0 10px;}
+  .sub{opacity:0.7; font-size:13px; margin:0 0 18px;}
+  label{display:block; font-size:12px; opacity:0.75; margin-bottom:6px; margin-top:14px;}
+  input,textarea,select{
+    width:100%; padding:12px 14px; border-radius:10px; border:1px solid rgba(255,255,255,0.18);
+    background:rgba(0,0,0,0.25); color:#fff; font-size:15px; letter-spacing:0.01em; font-family:inherit;
+  }
+  textarea{resize:vertical; min-height:60px;}
+  input:focus,textarea:focus,select:focus{outline:none; border-color:#5fd0ff;}
+  button{
+    padding:11px 16px; border:none; border-radius:10px;
+    background:#5fd0ff; color:#04202c; font-weight:700; font-size:14px; cursor:pointer;
+  }
+  button:disabled{opacity:0.5; cursor:default;}
+  button.ghost{background:transparent; border:1px solid rgba(255,255,255,0.25); color:#fff;}
+  button.small{padding:7px 12px; font-size:12px;}
+  button.full{width:100%; margin-top:14px;}
+  .err{color:#ff6b6b; font-size:13px; margin-top:10px; min-height:16px;}
+  .ok{color:#5fffb0; font-size:13px; margin-top:10px; min-height:16px;}
+  .topbar{display:flex; align-items:center; justify-content:space-between; margin-bottom:14px;}
+  .topbar h1{margin:0;}
+  .rest-row{display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid rgba(255,255,255,0.08); cursor:pointer;}
+  .rest-row:last-child{border-bottom:none;}
+  .rest-row img{width:44px;height:44px;border-radius:10px;object-fit:cover;background:rgba(255,255,255,0.08);}
+  .rest-row .info{flex:1; min-width:0;}
+  .rest-row .name{font-weight:600; font-size:14px;}
+  .rest-row .meta{font-size:12px; opacity:0.6;}
+  .badge{font-size:10px; padding:2px 8px; border-radius:999px; background:rgba(255,255,255,0.12); white-space:nowrap;}
+  .badge.live{background:#5fffb080;}
+  .badge.hidden{background:#ff6b6b80;}
+  .badge.draft{background:#666;}
+  .search{margin-bottom:10px;}
+  .empty{opacity:0.6; text-align:center; padding:20px 0; font-size:13px;}
+  .item-row{display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid rgba(255,255,255,0.08);}
+  .item-row:last-child{border-bottom:none;}
+  .item-row img{width:40px;height:40px;border-radius:8px;object-fit:cover;background:rgba(255,255,255,0.08);}
+  .item-row .info{flex:1; min-width:0;}
+  .item-row .name{font-size:13px; font-weight:600;}
+  .item-row .price{font-size:12px; opacity:0.7;}
+  .row2{display:flex; gap:8px;}
+  .row2 > *{flex:1;}
+  .imgpreview{width:100%; max-height:140px; object-fit:cover; border-radius:10px; margin-bottom:8px; background:rgba(255,255,255,0.08);}
+  .uploadbtn{display:inline-block; margin-top:6px;}
+  .note{font-size:11px; opacity:0.55; margin-top:4px;}
+  .pc-card{background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); border-radius:14px; padding:16px; margin-bottom:12px;}
+  .pc-head{display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;}
+  .pc-type{font-size:11px; padding:3px 9px; border-radius:999px; background:#5fd0ff30; color:#8fe3ff; font-weight:700;}
+  .pc-rest{font-size:12px; opacity:0.7; margin-bottom:8px;}
+  .pc-summary{font-size:14px; white-space:pre-line; margin-bottom:10px;}
+  .pc-img{width:100%; max-height:160px; object-fit:cover; border-radius:10px; margin-bottom:10px;}
+  .pc-actions{display:flex; gap:8px;}
+  .pc-actions button{flex:1;}
+  button.reject{background:#ff6b6b; color:#2a0505;}
+  #pendingBtn{position:relative;}
+  #pendingBtn.has-items{background:#ffb85f;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div id="keyView" class="card">
+    <h1>🌊 FALLS — Admin</h1>
+    <p class="sub">Images, names, prices and descriptions, plus reviewing restaurant-submitted changes. Visibility and orders are still Telegram-only.</p>
+    <label>Admin API Key</label>
+    <input id="adminKey" type="password" placeholder="Paste ADMIN_API_KEY"/>
+    <button class="full" id="keyBtn" onclick="saveKey()">CONTINUE</button>
+    <div class="err" id="keyErr"></div>
+  </div>
+
+  <div id="listView" style="display:none;">
+    <div class="topbar">
+      <h1>Restaurants</h1>
+      <div style="display:flex; gap:8px;">
+        <button class="small" id="pendingBtn" onclick="showPending()">📥 Pending (0)</button>
+        <button class="small ghost" onclick="logout()">Change key</button>
+      </div>
+    </div>
+    <div class="card">
+      <input class="search" id="searchBox" placeholder="Search by name or code (e.g. 001)" oninput="renderList()"/>
+      <div id="restList"><div class="empty">Loading...</div></div>
+    </div>
+  </div>
+
+  <div id="pendingView" style="display:none;">
+    <div class="topbar">
+      <h1>Pending Changes</h1>
+      <button class="small ghost" onclick="showList()">← Back</button>
+    </div>
+    <p class="sub">Everything a restaurant submitted from Telegram - already filled in below. Edit any field if needed, then Approve to publish live, or Reject. This mirrors the ✅/❌ buttons in Telegram, so whichever you use first is final.</p>
+    <div id="pendingList"><div class="empty">Loading...</div></div>
+  </div>
+
+  <div id="detailView" style="display:none;">
+    <div class="topbar">
+      <h1 id="detailName">Restaurant</h1>
+      <button class="small ghost" onclick="backToList()">← Back</button>
+    </div>
+
+    <div class="card">
+      <h2>Images</h2>
+      <label>Logo</label>
+      <img id="logoPreview" class="imgpreview" style="max-height:90px;max-width:90px;"/>
+      <input type="file" id="logoFile" accept="image/*" onchange="uploadImage('logo')"/>
+      <div class="note">Uploads immediately - shows on the website right away once this restaurant is visible.</div>
+
+      <label>Cover photo</label>
+      <img id="coverPreview" class="imgpreview"/>
+      <input type="file" id="coverFile" accept="image/*" onchange="uploadImage('cover')"/>
+    </div>
+
+    <div class="card">
+      <h2>Basic info</h2>
+      <label>Name</label>
+      <input id="editName"/>
+      <label>Description</label>
+      <textarea id="editDescription"></textarea>
+      <div class="row2">
+        <div>
+          <label>City</label>
+          <input id="editCity"/>
+        </div>
+        <div>
+          <label>Cuisine</label>
+          <input id="editCuisine"/>
+        </div>
+      </div>
+      <div class="row2">
+        <div>
+          <label>Delivery fee (₹)</label>
+          <input id="editDeliveryFee" type="number"/>
+        </div>
+        <div>
+          <label>Min order (₹)</label>
+          <input id="editMinOrder" type="number"/>
+        </div>
+      </div>
+      <button class="full" onclick="saveBasicInfo()">SAVE INFO</button>
+      <div class="ok" id="infoOk"></div>
+      <div class="err" id="infoErr"></div>
+    </div>
+
+    <div class="card">
+      <h2>Menu items — price, name, description, image</h2>
+      <div id="itemsList"><div class="empty">No items yet</div></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const BACKEND_URL = localStorage.getItem('backend_url') || 'https://falls-food-backend.onrender.com';
+let adminKey = sessionStorage.getItem('admin_key') || null;
+let restaurants = [];
+let currentRestaurant = null;
+
+function api(path, opts={}){
+  opts.headers = Object.assign({'X-Admin-Key': adminKey}, opts.headers||{});
+  return fetch(BACKEND_URL + path, opts);
+}
+
+function showKeyView(err){
+  document.getElementById('keyView').style.display='block';
+  document.getElementById('listView').style.display='none';
+  document.getElementById('detailView').style.display='none';
+  document.getElementById('pendingView').style.display='none';
+  document.getElementById('keyErr').textContent = err||'';
+}
+function showList(){
+  document.getElementById('keyView').style.display='none';
+  document.getElementById('listView').style.display='block';
+  document.getElementById('detailView').style.display='none';
+  document.getElementById('pendingView').style.display='none';
+  loadPendingCount();
+}
+function showDetail(){
+  document.getElementById('keyView').style.display='none';
+  document.getElementById('listView').style.display='none';
+  document.getElementById('detailView').style.display='block';
+  document.getElementById('pendingView').style.display='none';
+}
+function showPending(){
+  document.getElementById('keyView').style.display='none';
+  document.getElementById('listView').style.display='none';
+  document.getElementById('detailView').style.display='none';
+  document.getElementById('pendingView').style.display='block';
+  loadPending();
+}
+
+async function saveKey(){
+  const key = document.getElementById('adminKey').value.trim();
+  if(!key){ document.getElementById('keyErr').textContent='Enter the admin key'; return; }
+  adminKey = key;
+  const ok = await loadRestaurants();
+  if(ok){
+    sessionStorage.setItem('admin_key', adminKey);
+    showList();
+  } else {
+    document.getElementById('keyErr').textContent = 'Invalid key or server unreachable';
+  }
+}
+function logout(){
+  adminKey = null;
+  sessionStorage.removeItem('admin_key');
+  showKeyView();
+}
+
+async function loadRestaurants(){
+  try{
+    const res = await api('/api/admin/restaurants');
+    if(!res.ok) return false;
+    const data = await res.json();
+    restaurants = (data.restaurants||[]).filter(r=>r.status!=='DRAFT');
+    renderList();
+    return true;
+  }catch(e){ return false; }
+}
+
+async function loadPendingCount(){
+  try{
+    const res = await api('/api/admin/pending-changes');
+    if(!res.ok) return;
+    const list = await res.json();
+    const btn = document.getElementById('pendingBtn');
+    btn.textContent = `📥 Pending (${list.length})`;
+    btn.classList.toggle('has-items', list.length>0);
+  }catch(e){ /* leave last known count */ }
+}
+
+function pcTypeLabel(type){
+  return {ADD_ITEM:'➕ NEW ITEM', EDIT_PRICE:'💰 PRICE CHANGE', ITEM_IMAGE:'🖼 IMAGE', EDIT_ITEM:'✏️ ITEM EDIT'}[type] || type;
+}
+
+async function loadPending(){
+  const el = document.getElementById('pendingList');
+  el.innerHTML = '<div class="empty">Loading...</div>';
+  try{
+    const res = await api('/api/admin/pending-changes');
+    if(!res.ok){ el.innerHTML = '<div class="empty">Could not load</div>'; return; }
+    const list = await res.json();
+    renderPending(list);
+    loadPendingCount();
+  }catch(e){ el.innerHTML = '<div class="empty">Network error</div>'; }
+}
+
+function renderPending(list){
+  const el = document.getElementById('pendingList');
+  if(list.length===0){ el.innerHTML = '<div class="card"><div class="empty">Nothing waiting - you\'re all caught up.</div></div>'; return; }
+  el.innerHTML = list.map(c => {
+    const rest = restaurants.find(r=>r.id===c.restaurantId);
+    const restLabel = `[${c.code}] ${c.restaurantName || (rest ? rest.name : '')}`;
+    let fieldsHtml = '';
+    if(c.type==='ADD_ITEM'){
+      fieldsHtml = `
+        <label>Name</label><input id="pc_name_${c.id}" value="${(c.payload.name||'').replace(/"/g,'&quot;')}"/>
+        <label>Price (₹)</label><input id="pc_price_${c.id}" type="number" value="${c.payload.price}"/>
+        <label>Category</label><input id="pc_cat_${c.id}" value="${(c.payload.catName||'').replace(/"/g,'&quot;')}"/>`;
+    } else if(c.type==='EDIT_PRICE'){
+      fieldsHtml = `<label>New price (₹)</label><input id="pc_newprice_${c.id}" type="number" value="${c.payload.newPrice}"/>`;
+    }
+    const imgHtml = c.type==='ITEM_IMAGE' && c.payload?.imageUrl ? `<img class="pc-img" src="${c.payload.imageUrl}"/>` : '';
+    return `<div class="pc-card">
+      <div class="pc-head">
+        <span class="pc-type">${pcTypeLabel(c.type)}</span>
+        <span class="note">${new Date(c.createdAt).toLocaleString()}</span>
+      </div>
+      <div class="pc-rest">${restLabel}</div>
+      ${imgHtml}
+      <div class="pc-summary">${(c.summary||'').replace(/</g,'&lt;')}</div>
+      ${fieldsHtml}
+      <div class="pc-actions">
+        <button onclick="actOnPending('${c.id}','approve',this,'${c.type}')">✅ APPROVE & PUBLISH</button>
+        <button class="reject" onclick="actOnPending('${c.id}','reject',this,'${c.type}')">❌ REJECT</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function collectPendingOverrides(id, type){
+  if(type==='ADD_ITEM'){
+    const nameEl = document.getElementById('pc_name_'+id);
+    const priceEl = document.getElementById('pc_price_'+id);
+    const catEl = document.getElementById('pc_cat_'+id);
+    return { name: nameEl.value.trim(), price: Number(priceEl.value), catName: catEl.value.trim() };
+  }
+  if(type==='EDIT_PRICE'){
+    const priceEl = document.getElementById('pc_newprice_'+id);
+    return { newPrice: Number(priceEl.value) };
+  }
+  return {}; // ITEM_IMAGE has nothing to edit here - approve as submitted, or reject and re-upload from the restaurant's detail page
+}
+
+async function actOnPending(id, action, btnEl, type){
+  const card = btnEl.closest('.pc-card');
+  card.querySelectorAll('button,input').forEach(b=>b.disabled=true);
+  try{
+    const body = action==='approve' ? collectPendingOverrides(id, type) : undefined;
+    const res = await api(`/api/admin/pending-changes/${id}/${action}`, {
+      method:'POST',
+      headers: body ? {'Content-Type':'application/json'} : undefined,
+      body: body ? JSON.stringify(body) : undefined
+    });
+    const data = await res.json();
+    if(!res.ok) throw new Error(data.error||'Failed');
+    card.style.opacity='0.4';
+    card.querySelector('.pc-summary').insertAdjacentHTML('afterend', `<div class="ok">${action==='approve'?'Applied to the website ✓':'Rejected ✓'}</div>`);
+    loadPendingCount();
+  }catch(e){
+    alert((action==='approve'?'Approve':'Reject')+' failed: '+e.message);
+    card.querySelectorAll('button,input').forEach(b=>b.disabled=false);
+  }
+}
+
+function renderList(){
+  const q = (document.getElementById('searchBox').value||'').toLowerCase();
+  const el = document.getElementById('restList');
+  let list = restaurants;
+  if(q) list = list.filter(r => (r.name||'').toLowerCase().includes(q) || (r.code||'').includes(q));
+  list = list.slice().sort((a,b)=> (a.code||'').localeCompare(b.code||''));
+  if(list.length===0){ el.innerHTML = '<div class="empty">No restaurants found</div>'; return; }
+  el.innerHTML = list.map(r => {
+    const badge = r.status==='LIVE' && r.isVisible ? '<span class="badge live">LIVE & VISIBLE</span>'
+      : r.status==='LIVE' ? '<span class="badge hidden">LIVE but HIDDEN</span>'
+      : `<span class="badge draft">${r.status}</span>`;
+    return `<div class="rest-row" onclick="openRestaurant('${r.id}')">
+      <img src="${r.logoUrl || ''}" onerror="this.style.opacity=0"/>
+      <div class="info">
+        <div class="name">[${r.code}] ${r.name}</div>
+        <div class="meta">${r.cuisine||''}</div>
+      </div>
+      ${badge}
+    </div>`;
+  }).join('');
+}
+
+async function openRestaurant(id){
+  try{
+    const res = await api('/api/admin/restaurants/'+id);
+    if(!res.ok){ alert('Could not load restaurant'); return; }
+    currentRestaurant = await res.json();
+    document.getElementById('detailName').textContent = `[${currentRestaurant.code}] ${currentRestaurant.name}`;
+    document.getElementById('logoPreview').src = currentRestaurant.logoUrl||'';
+    document.getElementById('coverPreview').src = currentRestaurant.coverUrl||'';
+    document.getElementById('editName').value = currentRestaurant.name||'';
+    document.getElementById('editDescription').value = currentRestaurant.description||'';
+    document.getElementById('editCity').value = currentRestaurant.city||'';
+    document.getElementById('editCuisine').value = currentRestaurant.cuisine||'';
+    document.getElementById('editDeliveryFee').value = currentRestaurant.deliveryFee ?? '';
+    document.getElementById('editMinOrder').value = currentRestaurant.minOrder ?? '';
+    document.getElementById('infoOk').textContent='';
+    document.getElementById('infoErr').textContent='';
+    renderItems();
+    showDetail();
+  }catch(e){ alert('Network error'); }
+}
+function backToList(){ loadRestaurants(); showList(); }
+
+async function saveBasicInfo(){
+  const body = {
+    name: document.getElementById('editName').value.trim(),
+    description: document.getElementById('editDescription').value.trim(),
+    city: document.getElementById('editCity').value.trim(),
+    cuisine: document.getElementById('editCuisine').value.trim(),
+    deliveryFee: Number(document.getElementById('editDeliveryFee').value)||0,
+    minOrder: Number(document.getElementById('editMinOrder').value)||0
+  };
+  const okEl = document.getElementById('infoOk'); const errEl = document.getElementById('infoErr');
+  okEl.textContent=''; errEl.textContent='';
+  try{
+    const res = await api('/api/admin/restaurants/'+currentRestaurant.id, {
+      method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    if(!res.ok) throw new Error(data.error||'Save failed');
+    okEl.textContent = 'Saved ✓';
+    document.getElementById('detailName').textContent = `[${currentRestaurant.code}] ${body.name}`;
+  }catch(e){ errEl.textContent = e.message; }
+}
+
+async function uploadImage(kind){
+  const fileInput = document.getElementById(kind+'File');
+  const file = fileInput.files[0];
+  if(!file) return;
+  const fd = new FormData();
+  fd.append('image', file);
+  try{
+    const res = await api(`/api/admin/restaurants/${currentRestaurant.id}/${kind}`, {method:'POST', body:fd});
+    const data = await res.json();
+    if(!res.ok) throw new Error(data.error||'Upload failed');
+    const url = BACKEND_URL + (data.logoUrl || data.coverUrl);
+    document.getElementById(kind+'Preview').src = url;
+  }catch(e){ alert('Upload failed: '+e.message); }
+}
+
+function renderItems(){
+  const items = currentRestaurant.items||[];
+  const el = document.getElementById('itemsList');
+  if(items.length===0){ el.innerHTML = '<div class="empty">No menu items yet</div>'; return; }
+  el.innerHTML = items.map(i => `
+    <div class="item-row">
+      <img src="${i.imageUrl||''}" onerror="this.style.opacity=0"/>
+      <div class="info">
+        <div class="name">${i.name}</div>
+        <div class="price">₹${i.price}</div>
+      </div>
+      <button class="small ghost" onclick="editItem('${i.id}')">Edit</button>
+    </div>`).join('');
+}
+
+async function editItem(itemId){
+  const item = (currentRestaurant.items||[]).find(i=>i.id===itemId);
+  if(!item) return;
+  const newName = prompt('Item name', item.name);
+  if(newName===null) return;
+  const newPriceStr = prompt('Price (₹)', item.price);
+  if(newPriceStr===null) return;
+  const newPrice = Number(newPriceStr);
+  if(!Number.isFinite(newPrice) || newPrice<=0){ alert('Invalid price'); return; }
+  const newDesc = prompt('Description', item.description||'');
+  if(newDesc===null) return;
+  try{
+    const res = await api('/api/admin/menu-items/'+itemId, {
+      method:'PATCH', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name:newName.trim(), price:newPrice, description:newDesc.trim()})
+    });
+    const data = await res.json();
+    if(!res.ok) throw new Error(data.error||'Save failed');
+    await openRestaurant(currentRestaurant.id);
+  }catch(e){ alert('Save failed: '+e.message); }
+}
+
+if(adminKey){
+  loadRestaurants().then(ok => { if(ok) showList(); else showKeyView(); });
+} else {
+  showKeyView();
+}
+</script>
+</body>
+</html>

@@ -3,6 +3,26 @@ services:
     name: falls-food-backend
     env: node
     plan: free
+    # ---- CONTENT PERSISTENCE (pick ONE - GitHub is free, Disk needs a paid plan) ----
+    #
+    # OPTION A - GitHub-backed (recommended, works on the Free plan):
+    # Restaurants/menu/categories are committed straight to this repo on every
+    # change, so they survive every restart automatically - no manual /restore,
+    # no paid plan. Set these two env vars (see backend/server.js "GITHUB-BACKED
+    # CONTENT PERSISTENCE" comment for full details):
+    #   GITHUB_TOKEN = a GitHub Personal Access Token with "repo" scope
+    #   GITHUB_REPO  = "yourname/yourrepo"
+    #
+    # OPTION B - Persistent Disk (needs a paid plan, covers orders too):
+    # Render's Free plan does NOT support disks; every restart/redeploy on
+    # Free wipes data.json and /uploads regardless of Option A.
+    #   1. Change `plan: free` above to `plan: starter` (or higher).
+    #   2. Uncomment the `disk:` block below.
+    #   3. Set DATA_DIR = /var/data in the Environment tab (or below).
+    # disk:
+    #   name: falls-data
+    #   mountPath: /var/data
+    #   sizeGB: 1
     buildCommand: npm install
     startCommand: node server.js
     envVars:
@@ -22,3 +42,9 @@ services:
         sync: false
       - key: WHATSAPP_SUPPORT_NUMBER
         sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_REPO
+        sync: false
+      # - key: DATA_DIR
+      #   value: /var/data   # only if using Option B (paid disk) above
