@@ -50,6 +50,10 @@
   .actions{display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;}
   .empty{opacity:0.6; text-align:center; padding:30px 0; font-size:14px;}
   .meta{font-size:12px; opacity:0.6; margin-top:16px;}
+  .receipt{margin-top:8px;}
+  .receipt img{max-width:120px; max-height:120px; border-radius:8px; border:1px solid rgba(255,255,255,0.18); cursor:pointer; display:block;}
+  .receipt a.doc{font-size:12px; color:#5fd0ff; text-decoration:none;}
+  .pay{font-size:12px; opacity:0.75; margin-top:4px;}
 </style>
 </head>
 <body>
@@ -164,6 +168,21 @@ function renderOrders(orders){
     const actions = (TRANSITIONS[o.status]||[]).map(([to,label])=>
       `<button class="small" onclick="updateStatus('${o.code}','${to}')">${label}</button>`
     ).join('');
+    // Receipt image the customer uploaded at checkout. This lives on the
+    // backend (receiptUrl is a relative /uploads/... path), so it needs the
+    // BACKEND_URL prefix to actually load here. PDFs can't render as an
+    // <img>, so those show as a plain "view receipt" link instead.
+    let receiptHtml = '';
+    if(o.receiptUrl){
+      const fullUrl = `${BACKEND_URL}${o.receiptUrl}`;
+      const isPdf = /\.pdf$/i.test(o.receiptUrl);
+      receiptHtml = `<div class="receipt">${
+        isPdf
+          ? `<a class="doc" href="${fullUrl}" target="_blank" rel="noopener">📄 View receipt (PDF)</a>`
+          : `<img src="${fullUrl}" alt="Payment receipt" onclick="window.open('${fullUrl}','_blank')"/>`
+      }</div>`;
+    }
+    const payHtml = o.paymentStatus ? `<div class="pay">Payment: ${o.paymentMethod||''} · ${o.paymentStatus}</div>` : '';
     return `
       <div class="order">
         <div class="order-head">
@@ -171,6 +190,8 @@ function renderOrders(orders){
           <span class="status ${o.status}">${o.status}</span>
         </div>
         <div class="items">${o.customerName} · ${items} · ₹${o.total}</div>
+        ${payHtml}
+        ${receiptHtml}
         ${actions ? `<div class="actions">${actions}</div>` : ''}
       </div>`;
   }).join('');

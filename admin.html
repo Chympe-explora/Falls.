@@ -91,8 +91,9 @@
   <div id="listView" style="display:none;">
     <div class="topbar">
       <h1>Restaurants</h1>
-      <div style="display:flex; gap:8px;">
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
         <button class="small" id="pendingBtn" onclick="showPending()">📥 Pending (0)</button>
+        <button class="small ghost" onclick="showSite()">🎨 Site</button>
         <button class="small ghost" onclick="logout()">Change key</button>
       </div>
     </div>
@@ -111,10 +112,42 @@
     <div id="pendingList"><div class="empty">Loading...</div></div>
   </div>
 
+  <div id="siteView" style="display:none;">
+    <div class="topbar">
+      <h1>Site Branding</h1>
+      <button class="small ghost" onclick="showList()">← Back</button>
+    </div>
+    <div class="card">
+      <h2>Site-wide logo</h2>
+      <p class="sub" style="margin-bottom:6px;">Shown in the header and startup screen for the whole platform - not tied to one restaurant.</p>
+      <img id="siteLogoPreview" class="imgpreview" style="max-height:90px;max-width:90px;"/>
+      <input class="filebtn" type="file" id="siteLogoFile" accept="image/*" onchange="uploadSiteImage('logo')"/>
+    </div>
+    <div class="card">
+      <h2>Site-wide background</h2>
+      <img id="siteBackgroundPreview" class="imgpreview"/>
+      <input class="filebtn" type="file" id="siteBackgroundFile" accept="image/*" onchange="uploadSiteImage('background')"/>
+      <div class="note">Both apply immediately across the site.</div>
+    </div>
+  </div>
+
   <div id="detailView" style="display:none;">
     <div class="topbar">
       <h1 id="detailName">Restaurant</h1>
       <button class="small ghost" onclick="backToList()">← Back</button>
+    </div>
+
+    <div class="card">
+      <h2>Controls</h2>
+      <div class="grid2" style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="small" id="visBtn" onclick="toggleVisibility()">Loading…</button>
+        <button class="small ghost" id="pinBtn" onclick="toggleFlag('pin')">📌 Pin</button>
+        <button class="small ghost" id="highlightBtn" onclick="toggleFlag('highlight')">✨ Highlight</button>
+        <button class="small ghost" id="premiumBtn" onclick="toggleFlag('premium')">👑 Premium</button>
+        <button class="small reject" id="suspendBtn" onclick="toggleFlag('suspend')">⛔ Suspend</button>
+        <button class="small ghost" onclick="relink()">🔗 Relink</button>
+      </div>
+      <div class="note" id="relinkNote"></div>
     </div>
 
     <div class="card">
@@ -179,32 +212,55 @@ function api(path, opts={}){
   return fetch(BACKEND_URL + path, opts);
 }
 
-function showKeyView(err){
-  document.getElementById('keyView').style.display='block';
+function hideAllViews(){
+  document.getElementById('keyView').style.display='none';
   document.getElementById('listView').style.display='none';
   document.getElementById('detailView').style.display='none';
   document.getElementById('pendingView').style.display='none';
+  document.getElementById('siteView').style.display='none';
+}
+function showKeyView(err){
+  hideAllViews();
+  document.getElementById('keyView').style.display='block';
   document.getElementById('keyErr').textContent = err||'';
 }
 function showList(){
-  document.getElementById('keyView').style.display='none';
+  hideAllViews();
   document.getElementById('listView').style.display='block';
-  document.getElementById('detailView').style.display='none';
-  document.getElementById('pendingView').style.display='none';
   loadPendingCount();
 }
 function showDetail(){
-  document.getElementById('keyView').style.display='none';
-  document.getElementById('listView').style.display='none';
+  hideAllViews();
   document.getElementById('detailView').style.display='block';
-  document.getElementById('pendingView').style.display='none';
 }
 function showPending(){
-  document.getElementById('keyView').style.display='none';
-  document.getElementById('listView').style.display='none';
-  document.getElementById('detailView').style.display='none';
+  hideAllViews();
   document.getElementById('pendingView').style.display='block';
   loadPending();
+}
+async function showSite(){
+  hideAllViews();
+  document.getElementById('siteView').style.display='block';
+  try{
+    const res = await fetch(BACKEND_URL+'/api/site-settings');
+    const data = await res.json();
+    document.getElementById('siteLogoPreview').src = data.logoUrl || '';
+    document.getElementById('siteBackgroundPreview').src = data.backgroundUrl || '';
+  }catch(e){ /* ignore */ }
+}
+async function uploadSiteImage(kind){
+  const fileInput = document.getElementById('site'+(kind==='logo'?'Logo':'Background')+'File');
+  const file = fileInput.files[0];
+  if(!file) return;
+  const fd = new FormData();
+  fd.append('image', file);
+  try{
+    const res = await api(`/api/admin/site-${kind}`, {method:'POST', body:fd});
+    const data = await res.json();
+    if(!res.ok) throw new Error(data.error||'Upload failed');
+    const url = BACKEND_URL + (data.logoUrl || data.backgroundUrl);
+    document.getElementById('site'+(kind==='logo'?'Logo':'Background')+'Preview').src = url;
+  }catch(e){ alert('Upload failed: '+e.message); }
 }
 
 async function saveKey(){
@@ -369,11 +425,53 @@ async function openRestaurant(id){
     document.getElementById('editMinOrder').value = currentRestaurant.minOrder ?? '';
     document.getElementById('infoOk').textContent='';
     document.getElementById('infoErr').textContent='';
+    renderControls();
     renderItems();
     showDetail();
   }catch(e){ alert('Network error'); }
 }
 function backToList(){ loadRestaurants(); showList(); }
+
+function renderControls(){
+  const r = currentRestaurant;
+  const visBtn = document.getElementById('visBtn');
+  visBtn.textContent = r.isVisible ? '🌐 Visible (tap to hide)' : '🚫 Hidden (tap to show)';
+  visBtn.disabled = r.status!=='LIVE';
+  document.getElementById('pinBtn').textContent = r.isPinned ? '📌 Pinned' : '📌 Pin';
+  document.getElementById('highlightBtn').textContent = r.isHighlighted ? '✨ Highlighted' : '✨ Highlight';
+  document.getElementById('premiumBtn').textContent = r.premium ? '👑 Premium' : '👑 Make Premium';
+  document.getElementById('suspendBtn').textContent = r.status==='SUSPENDED' ? '⛔ Suspended (tap to restore)' : '⛔ Suspend';
+  document.getElementById('relinkNote').textContent = '';
+}
+
+async function toggleVisibility(){
+  try{
+    const res = await api(`/api/admin/restaurants/${currentRestaurant.id}/visibility`, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({visible: !currentRestaurant.isVisible})
+    });
+    const data = await res.json();
+    if(!res.ok) throw new Error(data.error||'Failed');
+    currentRestaurant = {...currentRestaurant, ...data};
+    renderControls();
+  }catch(e){ alert(e.message); }
+}
+async function toggleFlag(flag){
+  try{
+    const res = await api(`/api/admin/restaurants/${currentRestaurant.id}/${flag}`, {method:'POST'});
+    const data = await res.json();
+    if(!res.ok) throw new Error(data.error||'Failed');
+    currentRestaurant = {...currentRestaurant, ...data};
+    renderControls();
+  }catch(e){ alert(e.message); }
+}
+async function relink(){
+  try{
+    const res = await api(`/api/admin/restaurants/${currentRestaurant.id}/relink`, {method:'POST'});
+    const data = await res.json();
+    if(!res.ok) throw new Error(data.error||'Failed');
+    document.getElementById('relinkNote').textContent = 'New link: '+data.linkUrl;
+  }catch(e){ alert(e.message); }
+}
 
 async function saveBasicInfo(){
   const body = {
@@ -424,7 +522,24 @@ function renderItems(){
         <div class="price">₹${i.price}</div>
       </div>
       <button class="small ghost" onclick="editItem('${i.id}')">Edit</button>
+      <label class="small ghost" style="display:inline-block;padding:7px 12px;font-size:12px;border:1px solid rgba(255,255,255,0.25);border-radius:10px;cursor:pointer;">
+        🖼 Image
+        <input type="file" accept="image/*" style="display:none" onchange="uploadItemImage('${i.id}', this)"/>
+      </label>
     </div>`).join('');
+}
+
+async function uploadItemImage(itemId, input){
+  const file = input.files[0];
+  if(!file) return;
+  const fd = new FormData();
+  fd.append('image', file);
+  try{
+    const res = await api(`/api/admin/menu-items/${itemId}/image`, {method:'POST', body:fd});
+    const data = await res.json();
+    if(!res.ok) throw new Error(data.error||'Upload failed');
+    await openRestaurant(currentRestaurant.id);
+  }catch(e){ alert('Upload failed: '+e.message); }
 }
 
 async function editItem(itemId){

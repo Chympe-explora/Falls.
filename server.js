@@ -77,7 +77,7 @@ const GITHUB_CONTENT_PATH = process.env.GITHUB_CONTENT_PATH || 'backend/content-
 // back to "Not linked" / "Invalid or expired link" and needs a brand new
 // link from the Super Admin, even though nothing about their restaurant
 // actually changed.
-const GITHUB_CONTENT_FIELDS = ['restaurants','categories','menuItems','pendingChanges','telegramAccounts','telegramLinks'];
+const GITHUB_CONTENT_FIELDS = ['restaurants','categories','menuItems','pendingChanges','telegramAccounts','telegramLinks','siteSettings'];
 const GITHUB_API = 'https://api.github.com';
 function githubConfigured(){ return !!(GITHUB_TOKEN && GITHUB_REPO); }
 async function githubGetContentFile(){
@@ -123,6 +123,42 @@ function syncContentToGitHub(message){
   });
   return githubSyncQueue;
 }
+// Strips any leading Telegram-command-looking text (e.g. "/additem",
+// "/additem /additem") that leaked into a saved item's name/description
+// from an old bug in the /additem handler. Old corrupted items were
+// committed to the GitHub content backup, so the bad text keeps coming
+// back on every restart even after the input-parsing bug itself is fixed -
+// this cleans existing data at load time instead of just preventing new
+// occurrences. Returns true if anything was changed.
+function sanitizeMenuItemText(){
+  let changed = false;
+  const stripLeadingCommands = (s)=>{
+    if(typeof s !== 'string') return s;
+    let out = s;
+    while(/^\s*\/\S+\b/.test(out)) out = out.replace(/^\s*\/\S+\b/, '');
+    return out.trim();
+  };
+  for(const item of db.menuItems||[]){
+    if(typeof item.name === 'string' && /^\s*\//.test(item.name)){
+      const cleanName = stripLeadingCommands(item.name);
+      if(cleanName && cleanName !== item.name){
+        // Descriptions were auto-generated from the (corrupted) name, so if
+        // it still matches the old "<name> - delicious, freshly made."
+        // template, regenerate it from the cleaned name too.
+        if(item.description === `${item.name} - delicious, freshly made.`){
+          item.description = `${cleanName} - delicious, freshly made.`;
+        }
+        item.name = cleanName;
+        changed = true;
+      }
+    }
+    if(typeof item.description === 'string' && /^\s*\//.test(item.description)){
+      const cleanDesc = stripLeadingCommands(item.description);
+      if(cleanDesc !== item.description){ item.description = cleanDesc; changed = true; }
+    }
+  }
+  return changed;
+}
 async function loadContentFromGitHub(){
   if(!githubConfigured()) return false;
   try{
@@ -132,6 +168,11 @@ async function loadContentFromGitHub(){
       if(content[f] !== undefined) db[f] = content[f];
     }
     console.log(`💾 Content restored from GitHub (${GITHUB_REPO}) - restaurants/menu survive resets automatically.`);
+    if(sanitizeMenuItemText()){
+      console.log('🧹 Cleaned up leftover "/command" text found in menu item names/descriptions');
+      saveDB();
+      syncContentToGitHub('auto-cleanup: stray /command text in menu items').catch(()=>{});
+    }
     return true;
   }catch(e){
     console.error('loadContentFromGitHub failed:', e.message);
@@ -264,7 +305,8 @@ let db = {
   auditLogs: [],
   idempotency: {}, // key -> orderCode
   receipts: [],
-  systemPaused: false // platform-wide emergency pause, toggled from the Super Admin bot
+  systemPaused: false, // platform-wide emergency pause, toggled from the Super Admin bot
+  siteSettings: { logoUrl: null, backgroundUrl: null } // site-wide logo/background, set via Super Admin Telegram menu
 };
 
 let dbFileExistedAtBoot = true;
@@ -534,6 +576,32 @@ function requireStaffAuth(req,res,next){
   }
 }
 
+// ---- OWNER WEB SESSION ----
+// Lets a restaurant owner manage their own restaurant from a browser
+// (owner.html) instead of only via Telegram. Logs in with the same
+// email+password set at registration; every action below is the exact
+// same logic the matching Telegram command runs, just reachable over
+// HTTP and scoped to req.ownerRestaurantId via the JWT below.
+const OWNER_TOKEN_TTL_SEC = 12*60*60;
+function issueOwnerToken(restaurantId){
+  return jwt.sign({restaurantId, role:'owner'}, JWT_SECRET, {expiresIn: OWNER_TOKEN_TTL_SEC});
+}
+function requireOwnerAuth(req,res,next){
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  if(!token) return res.status(401).json({error:'Missing owner session'});
+  try{
+    const payload = jwt.verify(token, JWT_SECRET);
+    if(payload.role!=='owner') throw new Error('wrong role');
+    const restaurant = db.restaurants.find(r=>r.id===payload.restaurantId);
+    if(!restaurant) throw new Error('restaurant gone');
+    req.ownerRestaurant = restaurant;
+    next();
+  }catch(e){
+    return res.status(401).json({error:'Owner session invalid or expired - log in again'});
+  }
+}
+
 // ================= EXPRESS APP =================
 const app = express();
 app.use(helmet({crossOriginResourcePolicy:false}));
@@ -574,6 +642,14 @@ app.get('/health/ready', (req,res)=>{
 // ---- PUBLIC CONFIG ----
 app.get('/api/config', (req,res)=>{
   res.json({whatsapp: WHATSAPP_NUMBER, frontendUrl: FRONTEND_URL});
+});
+
+// Site-wide logo/background, settable by the Super Admin from the Telegram
+// menu (see 'sa_site_logo' / 'sa_site_background' below). Falls back to the
+// index.html SITE_IMAGES asset-file config on the frontend when either is
+// unset, so setting only one of the two here doesn't break the other.
+app.get('/api/site-settings', (req,res)=>{
+  res.json(db.siteSettings || { logoUrl: null, backgroundUrl: null });
 });
 
 // ---- RESTAURANTS ----
@@ -840,6 +916,13 @@ if(TELEGRAM_BOT_TOKEN){
   // as a normal chat message.
   const pendingBroadcastAdmins = new Set();
 
+  // Generic "tap a button, then type the value" state for restaurant owners -
+  // lets buttons like Add Item / Edit Price / Edit UPI / Edit Hours / Edit
+  // Delivery Fee / Rename Category prompt for a single text reply instead of
+  // requiring the owner to remember and type a slash command from scratch.
+  // telegramUserId -> {type, restaurantId, ...extra fields for that type}
+  const pendingTextInput = new Map();
+
   // /start
   bot.start(async (ctx)=>{
     const payload = ctx.message.text.split(' ')[1] || '';
@@ -884,6 +967,7 @@ if(TELEGRAM_BOT_TOKEN){
       [Markup.button.callback('📦 Orders','sa_orders'), Markup.button.callback('💳 Payments','sa_payments')],
       [Markup.button.callback('📊 Analytics','sa_analytics'), Markup.button.callback('🩺 System Health','sa_health')],
       [Markup.button.callback('📢 Announcements','sa_announce'), Markup.button.callback('🚨 Emergency','sa_emergency')],
+      [Markup.button.callback('🖼 Site Logo','sa_site_logo'), Markup.button.callback('🌄 Site Background','sa_site_background')],
       [Markup.button.callback('🐙 GitHub','sa_github')]
     ]));
   }
@@ -943,6 +1027,14 @@ if(TELEGRAM_BOT_TOKEN){
         }
         if(data==='sa_health'){
           return ctx.reply(`🩺 SYSTEM HEALTH\nFrontend: 🟢\nBackend: 🟢\nDatabase: 🟢 ${db.restaurants.length} restaurants\nTelegram: 🟢\nOrdering: ${db.systemPaused ? '⏸ PAUSED' : '🟢 ACTIVE'}\nOrders today: ${db.orders.filter(o=>o.createdAt.startsWith(todayStr())).length}`);
+        }
+        if(data==='sa_site_logo'){
+          pendingAdminImage.set(tgUserId, {type:'site_logo'});
+          return ctx.reply(`🖼 Now send the photo to use as the site-wide logo (shown in the header and startup screen). Current: ${db.siteSettings && db.siteSettings.logoUrl ? 'set' : 'default 🌊 icon'}`);
+        }
+        if(data==='sa_site_background'){
+          pendingAdminImage.set(tgUserId, {type:'site_background'});
+          return ctx.reply(`🌄 Now send the photo to use as the site-wide background. Current: ${db.siteSettings && db.siteSettings.backgroundUrl ? 'set' : 'default waterfall image'}`);
         }
         if(data==='sa_orders'){
           const recent = db.orders.slice(-5).reverse();
@@ -1245,14 +1337,61 @@ if(TELEGRAM_BOT_TOKEN){
       if(data==='r_menu'){
         const cats = db.categories.filter(c=>c.restaurantId===restaurant.id);
         const items = db.menuItems.filter(i=>i.restaurantId===restaurant.id);
-        return ctx.reply(`🍔 MENU - ${items.length} items in ${cats.length} categories\nUse commands:\n/additem Name | Price | Category\n/myitems - list with numbers\n/setprice <number> <new price>\n/itemimage <number> (then send a photo)\n/mycats - list categories\n/renamecat <number> <new name> - goes live instantly\n/reordercat <numbers in new order> - goes live instantly\n\nEverything above goes live on the website instantly - admin is just notified, no approval wait.`, Markup.inlineKeyboard([
+        return ctx.reply(`🍔 MENU - ${items.length} items in ${cats.length} categories\n\nGoes live on the website instantly - no approval wait.`, Markup.inlineKeyboard([
           [Markup.button.callback('➕ ADD ITEM','r_add_item')],
-          [Markup.button.callback('👀 VIEW MENU','r_view_menu')]
+          [Markup.button.callback('👀 VIEW MENU','r_view_menu'), Markup.button.callback('📂 CATEGORIES','r_categories')]
         ]));
+      }
+      if(data==='r_add_item'){
+        pendingTextInput.set(tgUserId, {type:'additem', restaurantId:restaurant.id});
+        return ctx.reply('➕ ADD ITEM\nSend it as one message like this:\nName | Price | Category (category is optional)\n\nExample:\nChicken Burger | 250 | Burgers');
       }
       if(data==='r_view_menu'){
         const items = db.menuItems.filter(i=>i.restaurantId===restaurant.id).slice(0,10);
         return ctx.reply(items.map(i=>`${i.name} - ₹${i.price} ${i.isAvailable?'✅':'❌'}`).join('\n') || 'No items');
+      }
+      if(data==='r_categories'){
+        const cats = db.categories.filter(c=>c.restaurantId===restaurant.id).sort((a,b)=>a.sortOrder-b.sortOrder);
+        if(cats.length===0) return ctx.reply('No categories yet - one is created automatically the first time you add an item.');
+        const rows = cats.map((c,idx)=>[
+          Markup.button.callback(idx===0?'·':'⬆️','r_cat_up_'+c.id),
+          Markup.button.callback(`${c.emoji||'🍔'} ${c.name}`,'r_cat_noop'),
+          Markup.button.callback(idx===cats.length-1?'·':'⬇️','r_cat_down_'+c.id),
+          Markup.button.callback('✏️','r_cat_rename_'+c.id)
+        ]);
+        return ctx.reply('📂 CATEGORIES\n⬆️⬇️ reorder · ✏️ rename - both go live instantly.', Markup.inlineKeyboard(rows));
+      }
+      if(data==='r_cat_noop'){
+        return ctx.answerCbQuery();
+      }
+      if(data.startsWith('r_cat_up_') || data.startsWith('r_cat_down_')){
+        const goingUp = data.startsWith('r_cat_up_');
+        const catId = data.replace(goingUp?'r_cat_up_':'r_cat_down_','');
+        const cats = db.categories.filter(c=>c.restaurantId===restaurant.id).sort((a,b)=>a.sortOrder-b.sortOrder);
+        const idx = cats.findIndex(c=>c.id===catId);
+        const swapIdx = goingUp ? idx-1 : idx+1;
+        if(idx<0 || swapIdx<0 || swapIdx>=cats.length) return ctx.answerCbQuery();
+        const a = cats[idx], b = cats[swapIdx];
+        const tmp = a.sortOrder; a.sortOrder = b.sortOrder; b.sortOrder = tmp;
+        saveDB();
+        persistContentChange('update:reordercat:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
+        await ctx.answerCbQuery('Moved');
+        const newCats = db.categories.filter(c=>c.restaurantId===restaurant.id).sort((x,y)=>x.sortOrder-y.sortOrder);
+        const rows = newCats.map((c,i)=>[
+          Markup.button.callback(i===0?'·':'⬆️','r_cat_up_'+c.id),
+          Markup.button.callback(`${c.emoji||'🍔'} ${c.name}`,'r_cat_noop'),
+          Markup.button.callback(i===newCats.length-1?'·':'⬇️','r_cat_down_'+c.id),
+          Markup.button.callback('✏️','r_cat_rename_'+c.id)
+        ]);
+        return ctx.editMessageReplyMarkup({inline_keyboard: rows}).catch(()=>{});
+      }
+      if(data.startsWith('r_cat_rename_')){
+        const catId = data.replace('r_cat_rename_','');
+        const cat = db.categories.find(c=>c.id===catId && c.restaurantId===restaurant.id);
+        if(!cat) return ctx.answerCbQuery('Category not found');
+        pendingTextInput.set(tgUserId, {type:'renamecat', restaurantId:restaurant.id, catId:cat.id});
+        await ctx.answerCbQuery();
+        return ctx.reply(`✏️ Send the new name for "${cat.name}"`);
       }
       if(data==='r_toggle_open'){
         restaurant.isOpen = !restaurant.isOpen;
@@ -1267,12 +1406,24 @@ if(TELEGRAM_BOT_TOKEN){
         return ctx.editMessageText(`Busy mode: ${restaurant.isBusy?'🟡 BUSY':'🟢 Not busy'}`);
       }
       if(data==='r_payments'){
-        return ctx.reply(`💳 PAYMENT\nUPI ID: ${restaurant.upiId||'Not set'}\nQR: ${restaurant.upiQrUrl?'Set':'Not set'}\n\nSend:\n/setupi <upi_id>\nOr upload QR image`, Markup.inlineKeyboard([
-          [Markup.button.callback('✏️ EDIT UPI','r_edit_upi')]
+        return ctx.reply(`💳 PAYMENT\nUPI ID: ${restaurant.upiId||'Not set'}\nQR: ${restaurant.upiQrUrl?'Set':'Not set'}\nDelivery fee: ₹${restaurant.deliveryFee||0}`, Markup.inlineKeyboard([
+          [Markup.button.callback('✏️ EDIT UPI','r_edit_upi'), Markup.button.callback('📷 UPLOAD QR','r_edit_qr')],
+          [Markup.button.callback('🚚 EDIT DELIVERY FEE','r_edit_delivery')]
         ]));
       }
+      if(data==='r_edit_upi'){
+        pendingTextInput.set(tgUserId, {type:'setupi', restaurantId:restaurant.id});
+        return ctx.reply('✏️ Send your UPI ID\nExample: yourname@upi');
+      }
+      if(data==='r_edit_qr'){
+        return ctx.reply('📷 Just send the QR code photo now as your next message - it goes live immediately.');
+      }
+      if(data==='r_edit_delivery'){
+        pendingTextInput.set(tgUserId, {type:'setdelivery', restaurantId:restaurant.id});
+        return ctx.reply(`✏️ Send the delivery fee amount (in ₹, numbers only)\nCurrent: ₹${restaurant.deliveryFee||0}`);
+      }
       if(data==='setup_start'){
-        return ctx.reply('🏪 SETUP WIZARD\n1️⃣ Profile done\n2️⃣ Hours: send /sethours 10:00-22:00\n3️⃣ Menu: send /additem\n4️⃣ Payment: /setupi\n5️⃣ Delivery fee: /setdelivery\n6️⃣ Then /golive');
+        return ctx.reply('🏪 SETUP WIZARD\n1️⃣ Profile done\n2️⃣ Hours: tap 🕐 Hours\n3️⃣ Menu: tap 🍔 Menu → ➕ Add Item\n4️⃣ Payment: tap 💳 Payments\n5️⃣ Delivery fee: tap 💳 Payments → 🚚 Edit Delivery Fee\n6️⃣ Then tap 🟢 GO LIVE');
       }
       if(data==='r_golive'){
         await ctx.answerCbQuery();
@@ -1282,6 +1433,47 @@ if(TELEGRAM_BOT_TOKEN){
         const pin = ensureStaffPin(restaurant);
         saveDB();
         return ctx.reply(`👥 STAFF ACCESS\nToday's PIN: ${pin}\nRestaurant ID: ${restaurant.id}\n\nGive counter staff both, then send them to:\n${FRONTEND_URL}/staff.html\n\nThey'll be able to accept/reject and update today's orders only - no menu, prices, or payment access.\n\nPIN resets automatically at midnight. Shift change or think it leaked? Send /staffpin to regenerate it right now.`);
+      }
+      if(data==='r_prices'){
+        const items = db.menuItems.filter(i=>i.restaurantId===restaurant.id);
+        if(items.length===0) return ctx.reply('No items yet. Tap 🍔 Menu → ➕ Add Item first.');
+        const shown = items.slice(0,15);
+        const rows = shown.map(i=>[Markup.button.callback(`✏️ ${i.name} - ₹${i.price}`,'r_editprice_'+i.id)]);
+        return ctx.reply(`💰 PRICES - ${items.length} items\nTap an item to change its price.${items.length>15?'\n(Showing first 15)':''}`, Markup.inlineKeyboard(rows));
+      }
+      if(data.startsWith('r_editprice_')){
+        const itemId = data.replace('r_editprice_','');
+        const item = db.menuItems.find(i=>i.id===itemId && i.restaurantId===restaurant.id);
+        if(!item) return ctx.answerCbQuery('Item not found');
+        pendingTextInput.set(tgUserId, {type:'setprice', restaurantId:restaurant.id, itemId:item.id});
+        await ctx.answerCbQuery();
+        return ctx.reply(`✏️ Send the new price for "${item.name}" (current: ₹${item.price})`);
+      }
+      if(data==='r_profile'){
+        return ctx.reply(`🏪 PROFILE\nName: ${restaurant.name}\nCategory: ${restaurant.cuisine||restaurant.category||'Not set'}\nCity: ${restaurant.city||'Not set'}\nDescription: ${restaurant.description||'Not set'}\nDelivery fee: ₹${restaurant.deliveryFee||0}\nMin order: ${restaurant.minOrder ? '₹'+restaurant.minOrder : 'Not set'}\nHours: ${restaurant.openingHours||'Not set'}\n\nYou can update yourself:\nHours and Delivery Fee from their own buttons.\n\nName, category, city, description, or logo/cover photo need an admin update - message the admin to change those.`);
+      }
+      if(data==='r_hours'){
+        return ctx.reply(`🕐 HOURS\nCurrent: ${restaurant.openingHours||'Not set'}`, Markup.inlineKeyboard([
+          [Markup.button.callback('✏️ EDIT HOURS','r_edit_hours')]
+        ]));
+      }
+      if(data==='r_edit_hours'){
+        pendingTextInput.set(tgUserId, {type:'sethours', restaurantId:restaurant.id});
+        return ctx.reply('✏️ Send your hours\nExample: 10:00-22:00');
+      }
+      if(data==='r_sales'){
+        const orders = db.orders.filter(o=>o.restaurantId===restaurant.id);
+        const completed = orders.filter(o=>o.status==='COMPLETED');
+        const today = todayStr();
+        const todaysOrders = orders.filter(o=>o.createdAt.startsWith(today));
+        const totalRevenue = completed.reduce((sum,o)=>sum+(o.total||0),0);
+        const todayRevenue = todaysOrders.filter(o=>o.status==='COMPLETED').reduce((sum,o)=>sum+(o.total||0),0);
+        return ctx.reply(`📊 SALES\nToday: ${todaysOrders.length} orders - ₹${todayRevenue}\nAll time: ${orders.length} orders (${completed.length} completed) - ₹${totalRevenue}`);
+      }
+      if(data==='r_settings'){
+        return ctx.reply(`⚙️ SETTINGS\n${restaurant.name}\nStatus: ${restaurant.status} | ${restaurant.isOpen?'🟢 Open':'🔴 Closed'} | ${restaurant.isBusy?'🟡 Busy':'🟢 Not busy'}\n\nUse these buttons from the main menu to change things:\nProfile, Hours, Prices, Payments, Staff\n\nOr /staffpin to regenerate today's staff PIN immediately.`, Markup.inlineKeyboard([
+          [Markup.button.callback(restaurant.isOpen?'🔴 Close Shop':'🟢 Open Shop','r_toggle_open'), Markup.button.callback(restaurant.isBusy?'🟢 Not Busy':'🟡 Busy Mode','r_toggle_busy')]
+        ]));
       }
 
       ctx.answerCbQuery();
@@ -1689,6 +1881,16 @@ if(TELEGRAM_BOT_TOKEN){
     pendingAdminImage.set(ctx.from.id, {type:'cover', restaurantId:r.id, restaurantCode:r.code});
     ctx.reply(`📷 Now send the cover photo for ${r.name}. Goes live immediately.`);
   });
+  bot.command('sitelogo', (ctx)=>{
+    if(!isSuperAdmin(ctx.from.id)) return ctx.reply('Unauthorized');
+    pendingAdminImage.set(ctx.from.id, {type:'site_logo'});
+    ctx.reply('🖼 Now send the photo to use as the site-wide logo. Goes live immediately.');
+  });
+  bot.command('sitebackground', (ctx)=>{
+    if(!isSuperAdmin(ctx.from.id)) return ctx.reply('Unauthorized');
+    pendingAdminImage.set(ctx.from.id, {type:'site_background'});
+    ctx.reply('🌄 Now send the photo to use as the site-wide background. Goes live immediately.');
+  });
 
   // Super-admin-wide item list (any restaurant, unlike /myitems which is
   // scoped to the owner sending it) - gives the item numbers /edititem and
@@ -1802,6 +2004,77 @@ if(TELEGRAM_BOT_TOKEN){
   // handled by their own handler first and never reach here.
   bot.on('text', async (ctx)=>{
     const tgUserId = ctx.from.id;
+
+    // Tap-a-button-then-type replies (Add Item / Edit Price / Edit UPI /
+    // Edit Hours / Edit Delivery Fee / Rename Category). Checked before the
+    // announcement-broadcast state below since they're mutually exclusive.
+    if(pendingTextInput.has(tgUserId)){
+      const req = pendingTextInput.get(tgUserId);
+      const restaurant = db.restaurants.find(r=>r.id===req.restaurantId);
+      if(!restaurant){ pendingTextInput.delete(tgUserId); return ctx.reply('❌ Restaurant no longer exists.'); }
+      const text = ctx.message.text.trim();
+      if(req.type==='additem'){
+        pendingTextInput.delete(tgUserId);
+        // Same defensive stripping as the /additem command, in case the
+        // reply itself starts with a stray "/additem" (phone autocomplete,
+        // or the owner typing the old command out of habit).
+        let cleaned = text;
+        while(/^\s*\/additem\b/i.test(cleaned)) cleaned = cleaned.replace(/^\s*\/additem\b/i, '');
+        cleaned = cleaned.trim();
+        const parts = cleaned.split('|').map(s=>s.trim());
+        if(parts.length<2) return ctx.reply('❌ Usage: Name | Price | Category (optional)\nExample: Chicken Burger | 250 | Burgers');
+        const [name, priceStr, catName] = parts;
+        const price = Number(priceStr);
+        if(!name || !Number.isFinite(price) || price<=0) return ctx.reply('❌ Invalid name or price. Example: Chicken Burger | 250 | Burgers');
+        applyContentChangeAndNotify(restaurant, 'ADD_ITEM', {name, price, catName: catName||'General'}, `➕ NEW ITEM\n${name} - ₹${price}\nCategory: ${catName||'General'}`);
+        return ctx.reply(`✅ Added and live now:\n${name} - ₹${price}`);
+      }
+      if(req.type==='setprice'){
+        pendingTextInput.delete(tgUserId);
+        const item = db.menuItems.find(i=>i.id===req.itemId && i.restaurantId===restaurant.id);
+        if(!item) return ctx.reply('❌ Item no longer exists.');
+        const price = Number(text.replace(/[^\d.]/g,''));
+        if(!Number.isFinite(price) || price<=0) return ctx.reply('❌ Send just the number, e.g. 199');
+        applyContentChangeAndNotify(restaurant, 'EDIT_PRICE', {itemId:item.id, newPrice:price}, `💰 PRICE CHANGE\n${item.name}: ₹${item.price} → ₹${price}`);
+        return ctx.reply(`✅ Price updated and live now: ${item.name} - ₹${price}`);
+      }
+      if(req.type==='setupi'){
+        pendingTextInput.delete(tgUserId);
+        restaurant.upiId = text;
+        saveDB();
+        persistContentChange('update:setupi:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
+        return ctx.reply(`✅ UPI Updated: ${text}`);
+      }
+      if(req.type==='sethours'){
+        pendingTextInput.delete(tgUserId);
+        restaurant.openingHours = text;
+        saveDB();
+        persistContentChange('update:sethours:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
+        return ctx.reply(`✅ Hours updated: ${text}`);
+      }
+      if(req.type==='setdelivery'){
+        pendingTextInput.delete(tgUserId);
+        const fee = Number(text.replace(/[^\d.]/g,''));
+        if(!Number.isFinite(fee) || fee<0) return ctx.reply('❌ Send just the number, e.g. 30');
+        restaurant.deliveryFee = fee;
+        saveDB();
+        persistContentChange('update:setdelivery:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
+        return ctx.reply(`✅ Delivery fee set to ₹${fee}`);
+      }
+      if(req.type==='renamecat'){
+        pendingTextInput.delete(tgUserId);
+        const cat = db.categories.find(c=>c.id===req.catId && c.restaurantId===restaurant.id);
+        if(!cat) return ctx.reply('❌ Category no longer exists.');
+        const oldName = cat.name;
+        cat.name = text;
+        saveDB();
+        notifyAdminsCategoryChange(restaurant, `✏️ CATEGORY RENAMED\n[${restaurant.code}] ${restaurant.name}\n"${oldName}" → "${text}"\nAlready live.`);
+        persistContentChange('update:renamecat:'+restaurant.name).catch(e=>console.error('backup send failed', e.message));
+        return ctx.reply(`✅ Category renamed and live now: "${text}"`);
+      }
+      return;
+    }
+
     if(!isSuperAdmin(tgUserId) || !pendingBroadcastAdmins.has(tgUserId)) return;
     pendingBroadcastAdmins.delete(tgUserId);
     const text = ctx.message.text;
@@ -1845,6 +2118,14 @@ if(TELEGRAM_BOT_TOKEN){
           logAudit('superadmin:telegram', 'UPDATE_ITEM_IMAGE', item.id);
           persistContentChange('telegram:update_item_image:'+req.restaurantCode).catch(e=>console.error('backup send failed', e.message));
           return ctx.reply(`✅ Image updated for ${item.name}`, {reply_markup:{inline_keyboard:[[{text:'👀 PREVIEW', url:fileLink.href}]]}});
+        }
+        if(req.type==='site_logo' || req.type==='site_background'){
+          if(!db.siteSettings) db.siteSettings = { logoUrl:null, backgroundUrl:null };
+          if(req.type==='site_logo') db.siteSettings.logoUrl = fileLink.href; else db.siteSettings.backgroundUrl = fileLink.href;
+          saveDB();
+          logAudit('superadmin:telegram', req.type==='site_logo'?'UPDATE_SITE_LOGO':'UPDATE_SITE_BACKGROUND', 'site');
+          persistContentChange('telegram:update_'+req.type).catch(e=>console.error('backup send failed', e.message));
+          return ctx.reply(`✅ Site ${req.type==='site_logo'?'logo':'background'} updated - live on the website now.`, {reply_markup:{inline_keyboard:[[{text:'👀 PREVIEW', url:fileLink.href}]]}});
         }
       }catch(e){
         return ctx.reply('Failed to process photo: '+e.message);
@@ -2326,6 +2607,270 @@ app.post('/api/admin/menu-items/:id/image', requireAdminKey, upload.single('imag
   const owner = db.restaurants.find(r=>r.id===item.restaurantId);
   persistContentChange('webdashboard:update_item_image:'+(owner?owner.code:item.restaurantId)).catch(e=>console.error('backup send failed', e.message));
   res.json({ok:true, imageUrl:item.imageUrl});
+});
+
+// ---- ADMIN: site-wide logo/background (mirrors /sitelogo, /sitebackground) ----
+app.post('/api/admin/site-logo', requireAdminKey, upload.single('image'), (req,res)=>{
+  if(!req.file) return res.status(400).json({error:'No file'});
+  if(!db.siteSettings) db.siteSettings = { logoUrl:null, backgroundUrl:null };
+  db.siteSettings.logoUrl = `/uploads/${req.file.filename}`;
+  saveDB();
+  logAudit('superadmin:webdashboard', 'UPDATE_SITE_LOGO', 'site');
+  persistContentChange('webdashboard:update_site_logo').catch(e=>console.error('backup send failed', e.message));
+  res.json({ok:true, logoUrl:db.siteSettings.logoUrl});
+});
+app.post('/api/admin/site-background', requireAdminKey, upload.single('image'), (req,res)=>{
+  if(!req.file) return res.status(400).json({error:'No file'});
+  if(!db.siteSettings) db.siteSettings = { logoUrl:null, backgroundUrl:null };
+  db.siteSettings.backgroundUrl = `/uploads/${req.file.filename}`;
+  saveDB();
+  logAudit('superadmin:webdashboard', 'UPDATE_SITE_BACKGROUND', 'site');
+  persistContentChange('webdashboard:update_site_background').catch(e=>console.error('backup send failed', e.message));
+  res.json({ok:true, backgroundUrl:db.siteSettings.backgroundUrl});
+});
+
+// ---- ADMIN: show/hide (mirrors /show, /hide) ----
+app.post('/api/admin/restaurants/:id/visibility', requireAdminKey, (req,res)=>{
+  const r = db.restaurants.find(x=>x.id===req.params.id);
+  if(!r) return res.status(404).json({error:'Not found'});
+  const makeVisible = !!req.body.visible;
+  if(r.status!=='LIVE') return res.status(409).json({error:`${r.name} is not LIVE yet (status: ${r.status}) - it must finish setup and go live first.`});
+  r.isVisible = makeVisible;
+  saveDB();
+  logAudit('superadmin:webdashboard', makeVisible?'SHOW_RESTAURANT':'HIDE_RESTAURANT', r.id);
+  persistContentChange('webdashboard:'+(makeVisible?'show:':'hide:')+r.code).catch(e=>console.error('backup send failed', e.message));
+  res.json(publicRestaurant(r));
+});
+
+// ---- ADMIN: relink (mirrors /relink <code>) ----
+app.post('/api/admin/restaurants/:id/relink', requireAdminKey, (req,res)=>{
+  const r = db.restaurants.find(x=>x.id===req.params.id);
+  if(!r) return res.status(404).json({error:'Not found'});
+  if(!['APPROVED','LIVE'].includes(r.status)) return res.status(409).json({error:`${r.name} is status ${r.status} - only APPROVED or LIVE restaurants can be relinked.`});
+  const token = uuidv4().replace(/-/g,'').slice(0,16);
+  db.telegramLinks.push({token, restaurantId:r.id, used:false, createdAt:new Date().toISOString()});
+  saveDB();
+  logAudit('superadmin:webdashboard', 'RELINK_RESTAURANT', r.id);
+  syncContentToGitHub('relink:'+r.code).catch(e=>console.error('backup send failed', e.message));
+  res.json({ok:true, linkUrl: `https://t.me/${(process.env.TELEGRAM_BOT_USERNAME||'your_bot')}?start=link_${token}`});
+});
+
+// ================= OWNER API (restaurant owner web dashboard) =================
+// Every route below is the HTTP-reachable twin of a Telegram bot command a
+// restaurant owner already has (/additem, /setprice, /itemimage, /mycats,
+// /renamecat, /reordercat, /setupi, /sethours, /golive, /setdelivery,
+// /staffpin) - same logic, same audit trail, same instant-live behavior.
+app.post('/api/owner/login', staffLoginLimiter, (req,res)=>{
+  const { email, password } = req.body||{};
+  const r = db.restaurants.find(x=>x.email===email);
+  if(!r || !r.passwordHash || !bcrypt.compareSync(password||'', r.passwordHash)){
+    logAudit('owner:'+req.ip, 'OWNER_LOGIN_FAILED', email||'');
+    return res.status(401).json({error:'Invalid email or password'});
+  }
+  logAudit('owner:'+r.id, 'OWNER_LOGIN', r.id);
+  res.json({ok:true, token: issueOwnerToken(r.id), restaurant: publicRestaurant(r)});
+});
+
+app.get('/api/owner/me', requireOwnerAuth, (req,res)=>{
+  const r = req.ownerRestaurant;
+  const categories = db.categories.filter(c=>c.restaurantId===r.id).sort((a,b)=>a.sortOrder-b.sortOrder);
+  const items = db.menuItems.filter(i=>i.restaurantId===r.id);
+  res.json({...publicRestaurant(r), categories, items});
+});
+
+// /additem Name | Price | Category
+app.post('/api/owner/items', requireOwnerAuth, (req,res)=>{
+  const r = req.ownerRestaurant;
+  const { name, price, catName } = req.body||{};
+  const numPrice = Number(price);
+  if(!name || !Number.isFinite(numPrice) || numPrice<=0) return res.status(400).json({error:'Invalid name or price'});
+  const result = applyContentChangeAndNotify(r, 'ADD_ITEM', {name, price:numPrice, catName: catName||'General'}, `➕ NEW ITEM\n${name} - ₹${numPrice}\nCategory: ${catName||'General'}`);
+  if(!result.ok) return res.status(400).json({error:result.error});
+  res.json({ok:true});
+});
+
+// /setprice <item> <newPrice>
+app.patch('/api/owner/items/:id/price', requireOwnerAuth, (req,res)=>{
+  const r = req.ownerRestaurant;
+  const item = db.menuItems.find(i=>i.id===req.params.id && i.restaurantId===r.id);
+  if(!item) return res.status(404).json({error:'Item not found'});
+  const newPrice = Number(req.body.price);
+  if(!Number.isFinite(newPrice) || newPrice<=0) return res.status(400).json({error:'Invalid price'});
+  const oldPrice = item.price;
+  const result = applyContentChangeAndNotify(r, 'EDIT_PRICE', {itemId:item.id, newPrice}, `💰 PRICE CHANGE\n${item.name}\n₹${oldPrice} → ₹${newPrice}`);
+  if(!result.ok) return res.status(400).json({error:result.error});
+  res.json({ok:true, price:newPrice});
+});
+
+// Name/description/availability - direct edit, same fields the Super Admin
+// dashboard can set, just scoped to the owner's own items.
+app.patch('/api/owner/items/:id', requireOwnerAuth, (req,res)=>{
+  const r = req.ownerRestaurant;
+  const item = db.menuItems.find(i=>i.id===req.params.id && i.restaurantId===r.id);
+  if(!item) return res.status(404).json({error:'Item not found'});
+  const allowed = ['name','description','isAvailable','isVeg'];
+  const prev = {}; const next = {};
+  for(const key of allowed){
+    if(req.body[key] !== undefined){
+      prev[key] = item[key];
+      item[key] = req.body[key];
+      next[key] = item[key];
+    }
+  }
+  saveDB();
+  logAudit('restaurant:'+r.id, 'UPDATE_MENU_ITEM', item.id, prev, next);
+  persistContentChange('owner:update_item:'+r.code).catch(e=>console.error('backup send failed', e.message));
+  res.json(item);
+});
+
+// /itemimage <item>, then a photo - here it's just a file upload
+app.post('/api/owner/items/:id/image', requireOwnerAuth, upload.single('image'), (req,res)=>{
+  const r = req.ownerRestaurant;
+  const item = db.menuItems.find(i=>i.id===req.params.id && i.restaurantId===r.id);
+  if(!item) return res.status(404).json({error:'Item not found'});
+  if(!req.file) return res.status(400).json({error:'No file'});
+  const imageUrl = `/uploads/${req.file.filename}`;
+  const result = applyContentChangeAndNotify(r, 'ITEM_IMAGE', {itemId:item.id, imageUrl}, `🖼 IMAGE CHANGE\n${item.name}`);
+  if(!result.ok) return res.status(400).json({error:result.error});
+  res.json({ok:true, imageUrl});
+});
+
+// /mycats
+app.get('/api/owner/categories', requireOwnerAuth, (req,res)=>{
+  const cats = db.categories.filter(c=>c.restaurantId===req.ownerRestaurant.id).sort((a,b)=>a.sortOrder-b.sortOrder);
+  res.json(cats);
+});
+
+// /renamecat <number> <new name>
+app.patch('/api/owner/categories/:id', requireOwnerAuth, (req,res)=>{
+  const r = req.ownerRestaurant;
+  const cat = db.categories.find(c=>c.id===req.params.id && c.restaurantId===r.id);
+  if(!cat) return res.status(404).json({error:'Category not found'});
+  const newName = (req.body.name||'').trim();
+  if(!newName) return res.status(400).json({error:'Name cannot be empty'});
+  const oldName = cat.name;
+  cat.name = newName;
+  saveDB();
+  logAudit('restaurant:'+r.id, 'RENAME_CATEGORY', cat.id, {name:oldName}, {name:newName});
+  notifyAdminsCategoryChange(r, `✏️ CATEGORY RENAMED\n[${r.code}] ${r.name}\n"${oldName}" → "${newName}"\nAlready live.`);
+  persistContentChange('owner:renamecat:'+r.code).catch(e=>console.error('backup send failed', e.message));
+  res.json(cat);
+});
+
+// /reordercat 3,1,2
+app.post('/api/owner/categories/reorder', requireOwnerAuth, (req,res)=>{
+  const r = req.ownerRestaurant;
+  const cats = db.categories.filter(c=>c.restaurantId===r.id).sort((a,b)=>a.sortOrder-b.sortOrder);
+  const order = (req.body.order||[]).map(n=>Number(n));
+  if(order.length!==cats.length || order.some(i=>!Number.isInteger(i) || i<0 || i>=cats.length) || new Set(order).size!==order.length){
+    return res.status(400).json({error:`Send all ${cats.length} category indices, each exactly once.`});
+  }
+  order.forEach((origIdx, newPos)=>{ cats[origIdx].sortOrder = newPos; });
+  saveDB();
+  logAudit('restaurant:'+r.id, 'REORDER_CATEGORIES', r.id, null, order);
+  persistContentChange('owner:reordercat:'+r.code).catch(e=>console.error('backup send failed', e.message));
+  res.json({ok:true, categories: cats.sort((a,b)=>a.sortOrder-b.sortOrder)});
+});
+
+// /setupi, /sethours, /setdelivery
+app.post('/api/owner/upi', requireOwnerAuth, (req,res)=>{
+  const r = req.ownerRestaurant;
+  r.upiId = (req.body.upiId||'').trim();
+  saveDB();
+  persistContentChange('owner:setupi:'+r.code).catch(e=>console.error('backup send failed', e.message));
+  res.json({ok:true, upiId:r.upiId});
+});
+app.post('/api/owner/hours', requireOwnerAuth, (req,res)=>{
+  const r = req.ownerRestaurant;
+  r.openingHours = (req.body.openingHours||'').trim();
+  saveDB();
+  persistContentChange('owner:sethours:'+r.code).catch(e=>console.error('backup send failed', e.message));
+  res.json({ok:true, openingHours:r.openingHours});
+});
+app.post('/api/owner/delivery-fee', requireOwnerAuth, (req,res)=>{
+  const r = req.ownerRestaurant;
+  const fee = Number(req.body.deliveryFee);
+  if(!Number.isFinite(fee) || fee<0) return res.status(400).json({error:'Invalid delivery fee'});
+  r.deliveryFee = fee;
+  saveDB();
+  persistContentChange('owner:setdelivery:'+r.code).catch(e=>console.error('backup send failed', e.message));
+  res.json({ok:true, deliveryFee:fee});
+});
+
+// Restaurant's own logo/cover - same fields the Super Admin dashboard sets,
+// just self-service for the owner.
+app.post('/api/owner/logo', requireOwnerAuth, upload.single('image'), (req,res)=>{
+  const r = req.ownerRestaurant;
+  if(!req.file) return res.status(400).json({error:'No file'});
+  r.logoUrl = `/uploads/${req.file.filename}`;
+  saveDB();
+  logAudit('restaurant:'+r.id, 'UPDATE_LOGO', r.id);
+  persistContentChange('owner:update_logo:'+r.code).catch(e=>console.error('backup send failed', e.message));
+  res.json({ok:true, logoUrl:r.logoUrl});
+});
+app.post('/api/owner/cover', requireOwnerAuth, upload.single('image'), (req,res)=>{
+  const r = req.ownerRestaurant;
+  if(!req.file) return res.status(400).json({error:'No file'});
+  r.coverUrl = `/uploads/${req.file.filename}`;
+  saveDB();
+  logAudit('restaurant:'+r.id, 'UPDATE_COVER', r.id);
+  persistContentChange('owner:update_cover:'+r.code).catch(e=>console.error('backup send failed', e.message));
+  res.json({ok:true, coverUrl:r.coverUrl});
+});
+
+// /golive
+app.post('/api/owner/golive', requireOwnerAuth, (req,res)=>{
+  const r = req.ownerRestaurant;
+  const hasMenu = db.menuItems.some(i=>i.restaurantId===r.id);
+  const hasPayment = !!r.upiId;
+  const hasHours = !!r.openingHours;
+  if(!hasMenu) return res.status(400).json({error:'Need at least 1 menu item first.'});
+  if(!hasPayment) return res.status(400).json({error:'Set a UPI ID first.'});
+  if(!hasHours) return res.status(400).json({error:'Set opening hours first.'});
+  r.status='LIVE'; r.isOpen=true; r.isVisible=true;
+  saveDB();
+  logAudit('restaurant:'+r.id, 'GO_LIVE', r.id);
+  persistContentChange('owner:go_live:'+r.code).catch(e=>console.error('go-live backup send failed', e.message));
+  res.json({ok:true, status:r.status});
+});
+
+// Open/Close shop, Busy toggle (mirrors the r_toggle_open / r_toggle_busy buttons)
+app.post('/api/owner/toggle-open', requireOwnerAuth, (req,res)=>{
+  const r = req.ownerRestaurant;
+  r.isOpen = !r.isOpen;
+  saveDB();
+  logAudit('restaurant:'+r.id, r.isOpen?'OPEN_SHOP':'CLOSE_SHOP', r.id);
+  persistContentChange('owner:toggle_open:'+r.code).catch(e=>console.error('backup send failed', e.message));
+  res.json({ok:true, isOpen:r.isOpen});
+});
+app.post('/api/owner/toggle-busy', requireOwnerAuth, (req,res)=>{
+  const r = req.ownerRestaurant;
+  r.isBusy = !r.isBusy;
+  saveDB();
+  logAudit('restaurant:'+r.id, r.isBusy?'BUSY_MODE':'NOT_BUSY', r.id);
+  persistContentChange('owner:toggle_busy:'+r.code).catch(e=>console.error('backup send failed', e.message));
+  res.json({ok:true, isBusy:r.isBusy});
+});
+
+// /staffpin
+app.post('/api/owner/staffpin', requireOwnerAuth, (req,res)=>{
+  const r = req.ownerRestaurant;
+  const pin = regenerateStaffPin(r);
+  saveDB();
+  logAudit('restaurant:'+r.id, 'REGENERATE_STAFF_PIN', r.id);
+  res.json({ok:true, pin, restaurantId:r.id});
+});
+
+// /sales
+app.get('/api/owner/sales', requireOwnerAuth, (req,res)=>{
+  const r = req.ownerRestaurant;
+  const orders = db.orders.filter(o=>o.restaurantId===r.id);
+  const completed = orders.filter(o=>o.status==='COMPLETED');
+  const today = todayStr();
+  const todaysOrders = orders.filter(o=>o.createdAt.startsWith(today));
+  const totalRevenue = completed.reduce((sum,o)=>sum+(o.total||0),0);
+  const todayRevenue = todaysOrders.filter(o=>o.status==='COMPLETED').reduce((sum,o)=>sum+(o.total||0),0);
+  res.json({todayOrders:todaysOrders.length, todayRevenue, allTimeOrders:orders.length, allTimeCompleted:completed.length, totalRevenue});
 });
 
 // ---- ADMIN: pending changes (mirrors the Telegram /pending approve/reject) ----

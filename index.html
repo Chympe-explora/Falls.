@@ -17,8 +17,8 @@
      ============================================================ -->
 <script>
   window.SITE_IMAGES = {
-    BACKGROUND_IMAGE: 'waterfall.jpg',  // file inside frontend/assets/ used as the page background
-    LOGO_IMAGE: 'Sky.jpg'                       // file inside frontend/assets/ used as the site logo (blank = 🌊 text logo)
+    BACKGROUND_IMAGE: 'waterfall.webp',  // file inside frontend/assets/ used as the page background
+    LOGO_IMAGE: ''                       // file inside frontend/assets/ used as the site logo (blank = 🌊 text logo)
   };
 </script>
 </head>
@@ -281,6 +281,29 @@
       if(brandImg){ brandImg.src = src; brandImg.style.display = 'block'; }
       if(brandLetter){ brandLetter.style.display = 'none'; }
     }
+  })();
+
+  // Site-wide logo/background set by the Super Admin via the Telegram menu
+  // (🖼 Site Logo / 🌄 Site Background) take priority over the SITE_IMAGES
+  // asset-file config above whenever they're set - this lets the admin swap
+  // branding without touching the repo. Falls back silently to whatever
+  // applySiteImages() already set if the backend has neither configured.
+  (function applyBackendSiteImages(){
+    fetch(`${BACKEND_URL}/api/site-settings`).then(r=>r.json()).then(settings=>{
+      if(settings.backgroundUrl){
+        document.documentElement.style.setProperty('--bg-image', `url('${settings.backgroundUrl}')`);
+      }
+      if(settings.logoUrl){
+        var startupImg = document.getElementById('startupLogoImg');
+        var startupEmoji = document.getElementById('startupLogoEmoji');
+        if(startupImg){ startupImg.src = settings.logoUrl; startupImg.style.display = 'block'; }
+        if(startupEmoji){ startupEmoji.style.display = 'none'; }
+        var brandImg = document.getElementById('brandLogoImg');
+        var brandLetter = document.getElementById('brandLogoLetter');
+        if(brandImg){ brandImg.src = settings.logoUrl; brandImg.style.display = 'block'; }
+        if(brandLetter){ brandLetter.style.display = 'none'; }
+      }
+    }).catch(()=>{ /* backend unreachable - keep whatever applySiteImages() already set */ });
   })();
 </script>
 </body>

@@ -98,8 +98,24 @@ prices, or payment access):
 - Staff enter Restaurant ID + PIN at staff.html to accept/reject and move
   orders through Preparing -> Ready -> Completed.
 
+## 🧑‍🍳 Owner web dashboard (frontend/owner.html)
+Every restaurant-owner Telegram command (add item, price, item image,
+categories, UPI, hours, delivery fee, logo/cover, go live, open/close, busy
+mode, staff PIN, sales) is now also a button at frontend/owner.html.
+Logs in with the email+password used at registration (`/api/owner/login`),
+same instant-live behavior and audit trail as the matching Telegram command
+— it's a second front door onto the same data, not a separate system.
+
+## 🎛 Super Admin web dashboard additions
+admin.html now also has: item image upload per menu item, a Controls panel
+per restaurant (Show/Hide, Pin, Highlight, Premium, Suspend, Relink), and a
+Site Branding page (🎨 Site button) for the platform-wide logo/background —
+mirroring /show /hide /pin /highlight /premium /relink /sitelogo
+/sitebackground.
+
 ## Files
 - frontend/index.html, style.css, app.js
 - frontend/staff.html (staff daily-PIN order view - deploy alongside index.html)
+- frontend/owner.html (restaurant owner dashboard - deploy alongside index.html)
 - backend/server.js (complete backend + bot)
 - backend/package.json, render.yaml

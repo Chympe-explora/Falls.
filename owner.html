@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Falls — Owner Dashboard</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌊</text></svg>">
+<style>
+  :root{ color-scheme: dark; }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; min-height:100vh; font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+    background:linear-gradient(160deg,#0b1020,#101a2e 60%,#0b1020);
+    color:#f2f4f8; padding:16px;
+  }
+  .wrap{max-width:560px;margin:0 auto;}
+  .card{
+    background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12);
+    backdrop-filter:blur(14px); border-radius:16px; padding:20px; margin-bottom:14px;
+  }
+  h1{font-size:20px; margin:0 0 4px;}
+  h2{font-size:15px; margin:0 0 10px;}
+  .sub{opacity:0.7; font-size:13px; margin:0 0 18px;}
+  label{display:block; font-size:12px; opacity:0.75; margin-bottom:6px; margin-top:14px;}
+  input,textarea,select{
+    width:100%; padding:12px 14px; border-radius:10px; border:1px solid rgba(255,255,255,0.18);
+    background:rgba(0,0,0,0.25); color:#fff; font-size:15px; letter-spacing:0.01em; font-family:inherit;
+  }
+  textarea{resize:vertical; min-height:60px;}
+  input:focus,textarea:focus,select:focus{outline:none; border-color:#5fd0ff;}
+  button{
+    padding:11px 16px; border:none; border-radius:10px;
+    background:#5fd0ff; color:#04202c; font-weight:700; font-size:14px; cursor:pointer;
+  }
+  button:disabled{opacity:0.5; cursor:default;}
+  button.ghost{background:transparent; border:1px solid rgba(255,255,255,0.25); color:#fff;}
+  button.small{padding:7px 12px; font-size:12px;}
+  button.full{width:100%; margin-top:14px;}
+  button.warn{background:#ffb85f;}
+  button.danger{background:#ff6b6b; color:#2a0505;}
+  .err{color:#ff6b6b; font-size:13px; margin-top:10px; min-height:16px;}
+  .ok{color:#5fffb0; font-size:13px; margin-top:10px; min-height:16px;}
+  .topbar{display:flex; align-items:center; justify-content:space-between; margin-bottom:14px;}
+  .topbar h1{margin:0;}
+  .grid2{display:flex; gap:10px;}
+  .grid2 > *{flex:1;}
+  .imgpreview{width:100%; max-height:140px; object-fit:cover; border-radius:10px; margin-bottom:8px; background:rgba(255,255,255,0.08);}
+  .note{font-size:11px; opacity:0.55; margin-top:4px;}
+  .item-row{display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid rgba(255,255,255,0.08); flex-wrap:wrap;}
+  .item-row:last-child{border-bottom:none;}
+  .item-row img{width:44px;height:44px;border-radius:8px;object-fit:cover;background:rgba(255,255,255,0.08);}
+  .item-row .info{flex:1; min-width:0;}
+  .item-row .name{font-size:13px; font-weight:600;}
+  .item-row .price{font-size:12px; opacity:0.7;}
+  .item-actions{display:flex; gap:6px; flex-wrap:wrap; width:100%; margin-top:6px;}
+  .cat-row{display:flex; align-items:center; gap:8px; padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.08);}
+  .cat-row:last-child{border-bottom:none;}
+  .cat-row .name{flex:1; font-size:13px;}
+  .status-pill{font-size:11px; padding:3px 10px; border-radius:999px; background:rgba(255,255,255,0.12);}
+  .status-pill.on{background:#5fffb080;}
+  .status-pill.off{background:#ff6b6b80;}
+  .empty{opacity:0.6; text-align:center; padding:16px 0; font-size:13px;}
+  .filebtn{margin-top:6px;}
+  .stat{display:flex; justify-content:space-between; padding:6px 0; font-size:13px; border-bottom:1px solid rgba(255,255,255,0.06);}
+  .stat:last-child{border-bottom:none;}
+  .stat b{font-size:14px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div id="loginView" class="card">
+    <h1>🌊 FALLS — Owner Dashboard</h1>
+    <p class="sub">Log in with the email + password you registered with. Every button here does exactly what the matching Telegram command does — changes go live the same way.</p>
+    <label>Email</label>
+    <input id="loginEmail" type="email" placeholder="you@restaurant.com"/>
+    <label>Password</label>
+    <input id="loginPassword" type="password" placeholder="Password"/>
+    <button class="full" onclick="login()">LOG IN</button>
+    <div class="err" id="loginErr"></div>
+  </div>
+
+  <div id="dashView" style="display:none;">
+    <div class="topbar">
+      <h1 id="restName">Restaurant</h1>
+      <button class="small ghost" onclick="logout()">Log out</button>
+    </div>
+    <div style="display:flex; gap:8px; margin-bottom:14px; flex-wrap:wrap;">
+      <span class="status-pill" id="statusPill">STATUS</span>
+      <span class="status-pill" id="openPill">OPEN</span>
+      <span class="status-pill" id="busyPill">BUSY</span>
+      <span class="status-pill" id="visiblePill">VISIBILITY</span>
+    </div>
+
+    <div class="card">
+      <h2>Quick actions</h2>
+      <div class="grid2">
+        <button onclick="toggleOpen()" id="toggleOpenBtn">Loading…</button>
+        <button onclick="toggleBusy()" id="toggleBusyBtn">Loading…</button>
+      </div>
+      <button class="full warn" onclick="goLive()">🟢 GO LIVE</button>
+      <div class="ok" id="quickOk"></div>
+      <div class="err" id="quickErr"></div>
+    </div>
+
+    <div class="card">
+      <h2>Images</h2>
+      <label>Logo</label>
+      <img id="logoPreview" class="imgpreview" style="max-height:90px;max-width:90px;"/>
+      <input class="filebtn" type="file" id="logoFile" accept="image/*" onchange="uploadRestImage('logo')"/>
+      <label>Cover photo</label>
+      <img id="coverPreview" class="imgpreview"/>
+      <input class="filebtn" type="file" id="coverFile" accept="image/*" onchange="uploadRestImage('cover')"/>
+      <div class="note">Both go live immediately.</div>
+    </div>
+
+    <div class="card">
+      <h2>Add a menu item</h2>
+      <label>Name</label>
+      <input id="newItemName" placeholder="Chicken Burger"/>
+      <div class="grid2">
+        <div>
+          <label>Price (₹)</label>
+          <input id="newItemPrice" type="number" placeholder="250"/>
+        </div>
+        <div>
+          <label>Category</label>
+          <input id="newItemCat" placeholder="Burgers"/>
+        </div>
+      </div>
+      <button class="full" onclick="addItem()">➕ ADD ITEM</button>
+      <div class="ok" id="addItemOk"></div>
+      <div class="err" id="addItemErr"></div>
+    </div>
+
+    <div class="card">
+      <h2>Menu items</h2>
+      <div id="itemsList"><div class="empty">Loading…</div></div>
+    </div>
+
+    <div class="card">
+      <h2>Categories</h2>
+      <p class="note">Rename or tap ↑/↓ to reorder — both go live immediately.</p>
+      <div id="catsList"><div class="empty">Loading…</div></div>
+    </div>
+
+    <div class="card">
+      <h2>Payments &amp; hours</h2>
+      <label>UPI ID</label>
+      <input id="upiInput" placeholder="restaurant@upi"/>
+      <button class="small full" onclick="saveUpi()">SAVE UPI</button>
+      <label>Opening hours</label>
+      <input id="hoursInput" placeholder="10:00-22:00"/>
+      <button class="small full" onclick="saveHours()">SAVE HOURS</button>
+      <label>Delivery fee (₹)</label>
+      <input id="deliveryInput" type="number"/>
+      <button class="small full" onclick="saveDelivery()">SAVE DELIVERY FEE</button>
+      <div class="ok" id="settingsOk"></div>
+      <div class="err" id="settingsErr"></div>
+    </div>
+
+    <div class="card">
+      <h2>Staff access</h2>
+      <p class="note">Regenerating instantly invalidates the old PIN. Give the new one to today's counter staff at staff.html.</p>
+      <button class="full" onclick="regenStaffPin()">🔑 REGENERATE STAFF PIN</button>
+      <div class="ok" id="pinOk"></div>
+    </div>
+
+    <div class="card">
+      <h2>Sales</h2>
+      <div id="salesBox"><div class="empty">Loading…</div></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const BACKEND_URL = localStorage.getItem('backend_url') || 'https://falls-food-backend.onrender.com';
+let ownerToken = sessionStorage.getItem('owner_token') || null;
+let me = null;
+
+function api(path, opts={}){
+  opts.headers = Object.assign({'Authorization':'Bearer '+ownerToken}, opts.headers||{});
+  return fetch(BACKEND_URL + path, opts);
+}
+
+function showLogin(err){
+  document.getElementById('loginView').style.display='block';
+  document.getElementById('dashView').style.display='none';
+  document.getElementById('loginErr').textContent = err||'';
+}
+function showDash(){
+  document.getElementById('loginView').style.display='none';
+  document.getElementById('dashView').style.display='block';
+}
+
+async function login(){
+  const email = document.getElementById('loginEmail').value.trim();
+  const password = document.getElementById('loginPassword').value;
+  if(!email || !password){ document.getElementById('loginErr').textContent='Enter email and password'; return; }
+  try{
+    const res = await fetch(BACKEND_URL+'/api/owner/login', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({email,password})
+    });
+    const data = await res.json();
+    if(!res.ok) throw new Error(data.error||'Login failed');
+    ownerToken = data.token;
+    sessionStorage.setItem('owner_token', ownerToken);
+    await loadMe();
+    showDash();
+  }catch(e){ showLogin(e.message); }
+}
+function logout(){
+  ownerToken = null;
+  sessionStorage.removeItem('owner_token');
+  showLogin();
+}
+
+async function loadMe(){
+  const res = await api('/api/owner/me');
+  if(!res.ok){ throw new Error('Session expired'); }
+  me = await res.json();
+  renderAll();
+}
+
+function renderAll(){
+  document.getElementById('restName').textContent = `[${me.code}] ${me.name}`;
+  const statusPill = document.getElementById('statusPill');
+  statusPill.textContent = me.status;
+  statusPill.className = 'status-pill ' + (me.status==='LIVE'?'on':'off');
+  const openPill = document.getElementById('openPill');
+  openPill.textContent = me.isOpen ? '🟢 Open' : '🔴 Closed';
+  openPill.className = 'status-pill ' + (me.isOpen?'on':'off');
+  const busyPill = document.getElementById('busyPill');
+  busyPill.textContent = me.isBusy ? '🟡 Busy' : '🟢 Not busy';
+  busyPill.className = 'status-pill ' + (me.isBusy?'off':'on');
+  const visPill = document.getElementById('visiblePill');
+  visPill.textContent = me.isVisible ? '🌐 Visible' : '🚫 Hidden (admin-controlled)';
+  visPill.className = 'status-pill ' + (me.isVisible?'on':'off');
+
+  document.getElementById('toggleOpenBtn').textContent = me.isOpen ? '🔴 Close Shop' : '🟢 Open Shop';
+  document.getElementById('toggleBusyBtn').textContent = me.isBusy ? '🟢 Not Busy' : '🟡 Busy Mode';
+
+  document.getElementById('logoPreview').src = me.logoUrl || '';
+  document.getElementById('coverPreview').src = me.coverUrl || '';
+  document.getElementById('upiInput').value = me.upiId || '';
+  document.getElementById('hoursInput').value = me.openingHours || '';
+  document.getElementById('deliveryInput').value = me.deliveryFee || 0;
+
+  renderItems();
+  renderCats();
+  loadSales();
+}
+
+function renderItems(){
+  const el = document.getElementById('itemsList');
+  const items = me.items||[];
+  if(items.length===0){ el.innerHTML = '<div class="empty">No items yet — add one above</div>'; return; }
+  el.innerHTML = items.map(i => `
+    <div class="item-row">
+      <img src="${i.imageUrl||''}" onerror="this.style.opacity=0"/>
+      <div class="info">
+        <div class="name">${i.name} ${i.isAvailable?'':'(hidden)'}</div>
+        <div class="price">₹${i.price}</div>
+      </div>
+      <div class="item-actions">
+        <button class="small ghost" onclick="editPrice('${i.id}', ${i.price})">💰 Price</button>
+        <button class="small ghost" onclick="editNameDesc('${i.id}')">✏️ Name/Desc</button>
+        <button class="small ghost" onclick="toggleAvailable('${i.id}', ${i.isAvailable})">${i.isAvailable?'🙈 Hide':'👁 Show'}</button>
+        <label class="small ghost" style="display:inline-block;padding:7px 12px;font-size:12px;border:1px solid rgba(255,255,255,0.25);border-radius:10px;cursor:pointer;">
+          🖼 Image
+          <input type="file" accept="image/*" style="display:none" onchange="uploadItemImage('${i.id}', this)"/>
+        </label>
+      </div>
+    </div>`).join('');
+}
+
+function renderCats(){
+  const el = document.getElementById('catsList');
+  const cats = me.categories||[];
+  if(cats.length===0){ el.innerHTML = '<div class="empty">No categories yet — created automatically when you add an item</div>'; return; }
+  el.innerHTML = cats.map((c,idx) => `
+    <div class="cat-row">
+      <span class="name">${c.emoji||''} ${c.name}</span>
+      <button class="small ghost" onclick="moveCat(${idx},-1)" ${idx===0?'disabled':''}>↑</button>
+      <button class="small ghost" onclick="moveCat(${idx},1)" ${idx===cats.length-1?'disabled':''}>↓</button>
+      <button class="small ghost" onclick="renameCat('${c.id}','${c.name.replace(/'/g,"\\'")}')">Rename</button>
+    </div>`).join('');
+}
+
+async function toggleOpen(){
+  const res = await api('/api/owner/toggle-open', {method:'POST'});
+  const data = await res.json();
+  if(res.ok){ me.isOpen = data.isOpen; renderAll(); }
+}
+async function toggleBusy(){
+  const res = await api('/api/owner/toggle-busy', {method:'POST'});
+  const data = await res.json();
+  if(res.ok){ me.isBusy = data.isBusy; renderAll(); }
+}
+async function goLive(){
+  const okEl = document.getElementById('quickOk'), errEl = document.getElementById('quickErr');
+  okEl.textContent=''; errEl.textContent='';
+  try{
+    const res = await api('/api/owner/golive', {method:'POST'});
+    const data = await res.json();
+    if(!res.ok) throw new Error(data.error);
+    okEl.textContent = '🟢 Live now!';
+    await loadMe();
+  }catch(e){ errEl.textContent = e.message; }
+}
+
+async function uploadRestImage(kind){
+  const fileInput = document.getElementById(kind+'File');
+  const file = fileInput.files[0];
+  if(!file) return;
+  const fd = new FormData();
+  fd.append('image', file);
+  try{
+    const res = await api('/api/owner/'+kind, {method:'POST', body:fd});
+    const data = await res.json();
+    if(!res.ok) throw new Error(data.error||'Upload failed');
+    document.getElementById(kind+'Preview').src = BACKEND_URL + (data.logoUrl || data.coverUrl);
+  }catch(e){ alert('Upload failed: '+e.message); }
+}
+
+async function addItem(){
+  const okEl = document.getElementById('addItemOk'), errEl = document.getElementById('addItemErr');
+  okEl.textContent=''; errEl.textContent='';
+  const name = document.getElementById('newItemName').value.trim();
+  const price = document.getElementById('newItemPrice').value;
+  const catName = document.getElementById('newItemCat').value.trim();
+  try{
+    const res = await api('/api/owner/items', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name,price,catName})
+    });
+    const data = await res.json();
+    if(!res.ok) throw new Error(data.error);
+    okEl.textContent = '✅ Added and live';
+    document.getElementById('newItemName').value='';
+    document.getElementById('newItemPrice').value='';
+    document.getElementById('newItemCat').value='';
+    await loadMe();
+  }catch(e){ errEl.textContent = e.message; }
+}
+
+async function editPrice(itemId, current){
+  const newPrice = prompt('New price (₹)', current);
+  if(newPrice===null) return;
+  const res = await api('/api/owner/items/'+itemId+'/price', {
+    method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({price:Number(newPrice)})
+  });
+  const data = await res.json();
+  if(!res.ok){ alert(data.error); return; }
+  await loadMe();
+}
+async function editNameDesc(itemId){
+  const item = (me.items||[]).find(i=>i.id===itemId);
+  const newName = prompt('Name', item.name);
+  if(newName===null) return;
+  const newDesc = prompt('Description', item.description||'');
+  if(newDesc===null) return;
+  const res = await api('/api/owner/items/'+itemId, {
+    method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:newName.trim(), description:newDesc.trim()})
+  });
+  if(!res.ok){ const d = await res.json(); alert(d.error); return; }
+  await loadMe();
+}
+async function toggleAvailable(itemId, current){
+  const res = await api('/api/owner/items/'+itemId, {
+    method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({isAvailable:!current})
+  });
+  if(!res.ok){ const d = await res.json(); alert(d.error); return; }
+  await loadMe();
+}
+async function uploadItemImage(itemId, input){
+  const file = input.files[0];
+  if(!file) return;
+  const fd = new FormData();
+  fd.append('image', file);
+  try{
+    const res = await api('/api/owner/items/'+itemId+'/image', {method:'POST', body:fd});
+    const data = await res.json();
+    if(!res.ok) throw new Error(data.error);
+    await loadMe();
+  }catch(e){ alert('Upload failed: '+e.message); }
+}
+
+async function renameCat(catId, current){
+  const newName = prompt('New category name', current);
+  if(newName===null || !newName.trim()) return;
+  const res = await api('/api/owner/categories/'+catId, {
+    method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:newName.trim()})
+  });
+  if(!res.ok){ const d = await res.json(); alert(d.error); return; }
+  await loadMe();
+}
+async function moveCat(idx, dir){
+  const cats = me.categories||[];
+  const order = cats.map((_,i)=>i);
+  const target = idx+dir;
+  if(target<0 || target>=cats.length) return;
+  [order[idx], order[target]] = [order[target], order[idx]];
+  const res = await api('/api/owner/categories/reorder', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({order})
+  });
+  if(!res.ok){ const d = await res.json(); alert(d.error); return; }
+  await loadMe();
+}
+
+async function saveUpi(){
+  const okEl = document.getElementById('settingsOk'), errEl = document.getElementById('settingsErr');
+  okEl.textContent=''; errEl.textContent='';
+  const upiId = document.getElementById('upiInput').value.trim();
+  const res = await api('/api/owner/upi', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({upiId})});
+  const data = await res.json();
+  if(!res.ok){ errEl.textContent = data.error; return; }
+  okEl.textContent = 'UPI saved ✓'; me.upiId = data.upiId;
+}
+async function saveHours(){
+  const okEl = document.getElementById('settingsOk'), errEl = document.getElementById('settingsErr');
+  okEl.textContent=''; errEl.textContent='';
+  const openingHours = document.getElementById('hoursInput').value.trim();
+  const res = await api('/api/owner/hours', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({openingHours})});
+  const data = await res.json();
+  if(!res.ok){ errEl.textContent = data.error; return; }
+  okEl.textContent = 'Hours saved ✓'; me.openingHours = data.openingHours;
+}
+async function saveDelivery(){
+  const okEl = document.getElementById('settingsOk'), errEl = document.getElementById('settingsErr');
+  okEl.textContent=''; errEl.textContent='';
+  const deliveryFee = document.getElementById('deliveryInput').value;
+  const res = await api('/api/owner/delivery-fee', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({deliveryFee})});
+  const data = await res.json();
+  if(!res.ok){ errEl.textContent = data.error; return; }
+  okEl.textContent = 'Delivery fee saved ✓';
+}
+
+async function regenStaffPin(){
+  const res = await api('/api/owner/staffpin', {method:'POST'});
+  const data = await res.json();
+  if(!res.ok){ alert(data.error); return; }
+  document.getElementById('pinOk').textContent = `New PIN: ${data.pin} (old PIN stopped working immediately)`;
+}
+
+async function loadSales(){
+  const res = await api('/api/owner/sales');
+  const el = document.getElementById('salesBox');
+  if(!res.ok){ el.innerHTML = '<div class="empty">Could not load sales</div>'; return; }
+  const s = await res.json();
+  el.innerHTML = `
+    <div class="stat"><span>Today's orders</span><b>${s.todayOrders}</b></div>
+    <div class="stat"><span>Today's revenue</span><b>₹${s.todayRevenue}</b></div>
+    <div class="stat"><span>All-time orders</span><b>${s.allTimeOrders} (${s.allTimeCompleted} completed)</b></div>
+    <div class="stat"><span>All-time revenue</span><b>₹${s.totalRevenue}</b></div>`;
+}
+
+if(ownerToken){
+  loadMe().then(showDash).catch(()=>{ ownerToken=null; sessionStorage.removeItem('owner_token'); showLogin(); });
+} else {
+  showLogin();
+}
+</script>
+</body>
+</html>
