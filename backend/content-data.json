@@ -17,7 +17,7 @@
       "isPinned": false,
       "isHighlighted": false,
       "isOpen": true,
-      "isBusy": false,
+      "isBusy": true,
       "deliveryFee": 30,
       "minOrder": 199,
       "deliveryTime": "30-40 min",
@@ -26,7 +26,9 @@
       "upiId": "senlysuchiang87@gmail.com",
       "upiQrUrl": null,
       "createdAt": "2026-08-08T20:55:02.229Z",
-      "passwordHash": "$2a$10$w6YQYVAk83WKFrI4KyhaBO3yw3NwtrNA46HFHt.dRgSdIVZ4RtF9W"
+      "passwordHash": "$2a$10$w6YQYVAk83WKFrI4KyhaBO3yw3NwtrNA46HFHt.dRgSdIVZ4RtF9W",
+      "staffPin": "265135",
+      "staffPinDate": "2026-08-09"
     },
     {
       "id": "rest-002",
